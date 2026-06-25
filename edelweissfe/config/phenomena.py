@@ -52,6 +52,8 @@ phenomena = {
     "concentration": "scalar",
     "chemical potential": "scalar",
     "strain symmetric": "symmetric tensor second order",
+    "pressure": "scalar",
+    "jacobi": "scalar",
 }
 
 
@@ -66,6 +68,8 @@ fieldCorrectionTolerance = {
     "chemical potential": 1e-1,
     "strain symmetric": 1e-8,
     "scalar variables": 1e-3,
+    "pressure": 1e-8,
+    "jacobi": 1e-8,
 }
 
 fluxResidualTolerance = {
@@ -78,6 +82,8 @@ fluxResidualTolerance = {
     "chemical potential": 1e-2,
     "strain symmetric": 1e-8,
     "scalar variables": 1e-8,
+    "pressure": 1e-8,
+    "jacobi": 1e-8,
 }
 
 fluxResidualToleranceAlternative = {
@@ -90,6 +96,8 @@ fluxResidualToleranceAlternative = {
     "chemical potential": 5e-2,
     "strain symmetric": 5e-3,
     "scalar variables": 1e-8,
+    "pressure": 1e-8,
+    "jacobi": 1e-8,
 }
 
 # domain                 dimensions

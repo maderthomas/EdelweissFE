@@ -1,0 +1,9 @@
+*step, solver=theSolver, maxInc=1e-1, minInc=1e-7, maxNumInc=200, maxIter=12, stepLength=1
+initializematerial, name=init, elSet=all
+dirichlet, name=left, nSet=gen_left,  field=displacement, 2=0, 1=0
+
+*step, solver=theSolver, maxInc=1e-2, minInc=1e-8, maxNumInc=10000, maxIter=12, stepLength=1
+dirichlet, name=right, nSet=gen_right, field=displacement, 2=120,
+**distributedload, name=dloadr, surface=gen_right, type=pressure, magnitude=100, f(t)=t
+**distributedload, name=dloadr, surface=gen_right, type=surface traction, magnitude='0, 6.25', f(t)=t
+**dirichlet, name=top, field=displacement, 2=-8

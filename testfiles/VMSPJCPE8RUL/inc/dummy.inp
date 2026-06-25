@@ -1,0 +1,42 @@
+*include, input=inc/material.inp
+
+*section, name=section1, thickness=1.0, material=mat, type=plane
+all
+
+*job, name=fbar_job, domain=2d
+*solver, solver=NISTParallelForMarmotElements, name=theSolver
+
+*fieldOutput
+create=perNode, name=displacement, elSet=all, field=displacement, result=U,
+create=perNode, name=micro rotation, elSet=all, field=micro rotation, result=U,
+create=perNode, name=nonlocal damage, elSet=all, field=nonlocal damage, result=U,
+create=perNode, name=umag, elSet=all, field=displacement, result=U, f(x)=' linalg.norm ( x, axis=1 )'
+create=perNode, name=RF, nSet=gen_top, field=displacement, result=P, f(x)='sum(x[:,1])', saveHistory=True, export=DUMMY_OUTPUT_RF
+create=perNode, name=U, nSet=gen_top, field=displacement, result=U, f(x)='mean(x[:,1])', saveHistory=True, export=DUMMY_OUTPUT_U
+create=perElement, name=alphaP, elSet=all, result=alphaP, quadraturePoint=0:4, f(x)='max ( x[:,:], axis=1)'
+create=perElement, name=alphaD, elSet=all, result=alphaD, quadraturePoint=0:4, f(x)='max ( x[:,:], axis=1)'
+create=perElement, name=omega, elSet=all, result=omega, quadraturePoint=0:4, f(x)='max ( x[:,:], axis=1)'
+create=perElement, name=stress, elSet=all, result=stress, quadraturePoint=0:4, f(x)='np.mean( x, axis=1)'
+
+*modelGenerator, generator=planeRectQuad, name=gen
+x0=10, l=DUMMY_WIDTH
+y0=0, h=DUMMY_HEIGHT
+elType=DUMMY_ELTYPE
+nX=DUMMY_NX
+nY=DUMMY_NY
+
+*output, type=ensight, name=DUMMY_ENSIGHT
+configuration, overwrite=True
+create=perNode, fieldOutput=displacement,
+create=perNode, fieldOutput=micro rotation
+create=perNode, fieldOutput=nonlocal damage
+create=perElement, fieldOutput=alphaP
+create=perElement, fieldOutput=alphaD
+create=perElement, fieldOutput=omega
+create=perElement, fieldOutput=stress
+
+*constraint, type=linearizedRigidBody, name=rb1
+nSet=gen_top
+referencePoint=gen_rightTop
+
+*include, input=inc/steps.inp

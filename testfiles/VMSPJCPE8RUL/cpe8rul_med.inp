@@ -1,0 +1,28 @@
+*include, input=inc/material.inp
+
+*section, name=section1, thickness=1.0, material=mat, type=plane
+all
+
+*job, name=fbar_job, domain=2d
+*solver, solver=NISTParallelForMarmotElements, name=theSolver
+
+*fieldOutput
+create=perNode, name=displacement, elSet=all, field=displacement, result=U,
+create=perNode, name=umag, elSet=all, field=displacement, result=U, f(x)=' linalg.norm ( x, axis=1 )'
+create=perNode, name=RF, nSet=gen_left, field=displacement, result=P, f(x)='sum(x[:,1])', saveHistory=True, export=rf_cpe8rul_med
+create=perNode, name=U, nSet=gen_right, field=displacement, result=U, f(x)='mean(x[:,1])', saveHistory=True, export=u_cpe8rul_med
+create=perElement, name=stress, elSet=all, result=stress, quadraturePoint=0:4, f(x)='np.mean( x, axis=1)'
+
+*modelGenerator, generator=cooksmembrane, name=gen
+x0=0, l=48
+y0=0, h0=44, h1=16
+elType=CPE8RUL
+nX=15
+nY=10
+
+*output, type=ensight, name=_cpe8rul_med
+configuration, overwrite=True
+create=perNode, fieldOutput=displacement,
+create=perElement, fieldOutput=stress
+
+*include, input=inc/steps.inp
