@@ -92,13 +92,12 @@ documentation = [module]
 
 keyword = "step"
 if keyword in inputLanguage:
-    modules = [
-        inputLanguage["step"].getModule("adaptive").getKeyword("options"),
-        inputLanguage["step"].getModule("adaptiveForExplicitSimulations").getKeyword("options"),
-    ]
-    for optionsModule in modules:
-        optionsModule.addOptionalArg("intermediateSaveInterval", "", float, None)
-        optionsModule.addOptionalArg("minDTForOutput", "", float, None)
+    _stepModuleNames = ["adaptive", "adaptiveForExplicitSimulations"]
+    _stepModules = [m for m in inputLanguage["step"].modules if m.name in _stepModuleNames]
+    for _stepModule in _stepModules:
+        _optionsModule = _stepModule.getKeyword("options")
+        _optionsModule.addOptionalArg("intermediateSaveInterval", "", float, None)
+        _optionsModule.addOptionalArg("minDTForOutput", "", float, None)
 
 
 def writeCFloat(f, ndarray):
