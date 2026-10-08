@@ -142,3 +142,15 @@ def test_split_bar_sticking_out():
     assert abs(unembedded - 0.8) < 1e-9
     assert [p.hostElement.elNumber for p in parts] == [0, 2]
     assert abs(parts[0].etaStart - (-0.2)) < 1e-9
+
+
+@pytest.mark.parametrize("start, end", [((1.0, 1.0), (3.0, 1.0)), ((1.0, 0.5), (3.0, 1.7)), ((1.0, 1.0), (1.0, 3.0))])
+def test_split_bar_starting_on_host_boundary_has_no_degenerate_parts(start, end):
+    """a bar starting on a host edge or node must not get a zero-length part in a host it only touches"""
+    hosts = _quadGrid(4, 4, 4.0, 4.0)
+    locator = HostElementLocator(hosts)
+    bar = _element(1000, "bar2", [_node(100, start), _node(101, end)])
+    parts, unembedded = splitBarElementAtHostBoundaries(bar, locator)
+    assert unembedded == 0.0
+    assert all(p.etaEnd - p.etaStart > 1e-6 for p in parts)
+    assert parts[0].etaStart == -1.0 and parts[-1].etaEnd == 1.0

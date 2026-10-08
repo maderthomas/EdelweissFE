@@ -156,9 +156,15 @@ class EmbeddedBondSection:
         return model
 
     def assignSectionToElement(self, element, model):
+        self.assignSectionPropertiesToElement(element)
+
+    def assignSectionPropertiesToElement(self, element, material: dict = None):
+        """Assign the per-element properties and the (possibly modified, e.g., by a ``changeMaterialProperty``
+        step action) bond-slip law to a bond element."""
+        material = material or self.material
         element.setProperties(self.properties[element.elNumber])
         element.initializeElement()
-        element.setMaterial(self.material["name"], self.material["properties"])
+        element.setMaterial(material["name"], material["properties"])
 
 
 class Generator(GeneratorBase):
@@ -202,6 +208,13 @@ class Generator(GeneratorBase):
             unbondedLength += length - partsLength
 
             for part in parts:
+                shared = set(bar.nodes) & set(part.hostElement.nodes)
+                if shared:
+                    raise ValueError(
+                        f"{name}: bar element {bar.elNumber} shares node(s) {sorted(n.label for n in shared)} with "
+                        f"host element {part.hostElement.elNumber}; bond-slip needs bar nodes independent of the "
+                        "host (use the embeddedRegion constraint for perfect bond of a conforming bar mesh)."
+                    )
                 elType = bondElementType(nDim, barShape, part.hostElement.ensightType)
                 (label,) = model.topology.reserveElementNumbers(1)
                 bondElement = getElementClass(elType, "marmot")(elType, label)

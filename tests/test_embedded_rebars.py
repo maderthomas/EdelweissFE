@@ -408,3 +408,46 @@ maxInc=1.0, minInc=1e-8, maxNumInc=10, maxIter=10, stepLength=1
     scale = 0.002
     np.testing.assert_allclose(uRebarBond.getLastResult(), uRebarPerfect.getLastResult(), atol=1e-4 * scale)
     np.testing.assert_allclose(uHostBond.getLastResult(), uHostPerfect.getLastResult(), atol=1e-4 * scale)
+
+
+def test_bond_law_property_change_and_shared_nodes(tmp_path):
+    """a changeMaterialProperty step action drives the bond-slip law of the generated bond elements; a bar sharing
+    nodes with its host is rejected by the bond generator"""
+    Kt = 1000.0
+    deck = _pullOutDeck(
+        f"*material, name=LinearElasticBondSlip, id=bond, provider=marmot\n{Kt}, 1e6",
+        8,
+        """*step, solver=theSolver
+maxInc=1.0, minInc=1e-8, maxNumInc=10, maxIter=10, stepLength=1
+>>dirichlet, name=host, nSet=gen_all, field=displacement, 1=0, 2=0
+>>dirichlet, name=pull, nSet=loadedEnd, field=displacement, 1=0.01
+>>changeMaterialProperty, name=chProp, material=bond, index=0, f(t)='1000 + 3000 * t'
+""",
+    )
+    _, (F,) = _run(tmp_path, deck, "F")
+    _, (FRef,) = _run(
+        tmp_path, deck.replace(f"\n{Kt}, 1e6", "\n4000.0, 1e6").replace(">>changeMaterialProperty", "**"), "F"
+    )
+    np.testing.assert_allclose(F.getLastResult(), FRef.getLastResult(), rtol=1e-10)
+
+    # a bar along the bottom edge of the strip, using the host nodes
+    shared = _concreteStrip(nX=2, nY=1) + """*element, type=TR2D2
+100001, 1, 3
+
+*elSet, elSet=rebars
+100001
+
+*section, name=rebarSection, area=0.01, material=steel, type=truss
+rebars
+
+*material, name=LinearElasticBondSlip, id=bond, provider=marmot
+1000.0, 1e6
+
+*modelGenerator, generator=embeddedBond, name=rebarBond, executeAfterManualGeneration=True
+rebarElSet=rebars
+hostElSet=gen_all
+material=bond
+perimeter=0.3545
+""" + _UNIAXIAL_STEP.replace(">>perNode, name=RFrebar", "**").replace(">>perElement, name=rebarStrain", "**")
+    with pytest.raises(ValueError, match="shares node"):
+        _run(tmp_path, shared, "RF")

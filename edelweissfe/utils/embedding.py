@@ -182,7 +182,9 @@ def splitBarElementAtHostBoundaries(barElement, locator: HostElementLocator, sam
     """Split a bar element into the parts lying in individual host elements.
 
     The bar is sampled along its parametric coordinate, with a spacing well below the size of the smallest host
-    element, and the exit points of the bar from each host element are found by bisection.
+    element, and the exit points of the bar from each host element are found by bisection. Inside the host domain,
+    every crossed host element is found; a bar running outside of all host elements may miss a re-entry shorter than
+    the sample spacing (e.g., clipping a host corner), which then remains unbonded.
 
     Parameters
     ----------
@@ -222,7 +224,9 @@ def splitBarElementAtHostBoundaries(barElement, locator: HostElementLocator, sam
     parts = []
     unembedded = 0.0
     eta = -1.0
-    host = hostAt(eta)
+    # the host is chosen just ahead of the start, not at it: a bar starting on a host face, edge or node must not be
+    # assigned to a neighbor it only touches
+    host = hostAt(min(1.0, eta + 1e-9)) or hostAt(eta)
     iSample = 0
     while eta < 1.0:
         # march to the first sample beyond eta not in the current host (or not in any host)
@@ -254,7 +258,7 @@ def splitBarElementAtHostBoundaries(barElement, locator: HostElementLocator, sam
 
         etaExit = 1.0 if nextOutside is None else exitPoint(host, max(eta, etas[j - 1]), nextOutside)
         progress = etaExit > eta
-        if progress:
+        if etaExit - eta > 1e-9:  # skip degenerate parts, e.g., where the bar only touches a host
             parts.append(BarPart(barElement, host, eta, etaExit))
         if etaExit >= 1.0:
             break
