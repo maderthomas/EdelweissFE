@@ -1,4 +1,4 @@
-"""Embedded beams: Marmot Euler-Bernoulli beam elements (B23, B33) with the beam section, embedded in host
+"""Embedded beams: Marmot Euler-Bernoulli beam elements (BE2D2, BE3D2) with the beam section, embedded in host
 continuum elements by the embedded region constraint (perfect bond, with or without tying the rotations) and by the
 embedded bond generator (bond-slip), verified against analytical solutions.
 
@@ -29,7 +29,7 @@ def _marmotHas(elementType: str) -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not (_marmotHas("B23") and _marmotHas("B33") and _marmotHas("TR2D2") and _marmotHas("EB2D2Q4")),
+    not (_marmotHas("BE2D2") and _marmotHas("BE3D2") and _marmotHas("TR2D2") and _marmotHas("EB2D2Q4")),
     reason="Marmot is built without the BeamElement / TrussElement / EmbeddedBondElement modules",
 )
 
@@ -44,14 +44,25 @@ def _run(tmp_path, deck: str, *results):
     return model, [fieldOutputController.fieldOutputs[r] for r in results]
 
 
-def _line(firstLabel: int, start, end, nElements: int, elType: str):
-    """*node and *element blocks of a straight line of 2-node elements, and its first and last node labels."""
+def _line(firstLabel: int, start, end, nElements: int, elType: str, quadratic: bool = None):
+    """*node and *element blocks of a straight line of 2-node (or 3-node: end, end, mid, the mid nodes labeled from
+    firstLabel + 50000) elements, and its first and last node labels."""
+    if quadratic is None:
+        quadratic = elType.endswith("3") or elType in ("TR2D3", "TR3D3")
     start, end = np.asarray(start, float), np.asarray(end, float)
-    nodes = "\n".join(
-        f"{firstLabel + i}, " + ", ".join(f"{c:.12g}" for c in start + (end - start) * i / nElements)
-        for i in range(nElements + 1)
+
+    def node(label, s):
+        return f"{label}, " + ", ".join(f"{c:.12g}" for c in start + (end - start) * s)
+
+    nodes = [node(firstLabel + i, i / nElements) for i in range(nElements + 1)]
+    if quadratic:
+        nodes += [node(firstLabel + 50000 + i, (i + 0.5) / nElements) for i in range(nElements)]
+    elements = "\n".join(
+        f"{firstLabel + i}, {firstLabel + i}, {firstLabel + i + 1}"
+        + (f", {firstLabel + 50000 + i}" if quadratic else "")
+        for i in range(nElements)
     )
-    elements = "\n".join(f"{firstLabel + i}, {firstLabel + i}, {firstLabel + i + 1}" for i in range(nElements))
+    nodes = "\n".join(nodes)
     return f"*node\n{nodes}\n\n*element, type={elType}\n{elements}\n", firstLabel, firstLabel + nElements
 
 
@@ -91,7 +102,7 @@ def test_beam_cantilever_2d(tmp_path):
     I = b * h**3 / 12  # noqa: E741
     t, n = np.array([0.6, 0.8]), np.array([-0.8, 0.6])
     deck = _beamDeck(
-        "B23",
+        "BE2D2",
         (0, 0),
         L * t,
         4,
@@ -120,11 +131,11 @@ def test_beam_cantilever_3d(tmp_path):
     force = P * np.array([2.0, -1.0, 0.0]) / math.sqrt(5)  # normal to the axis
     torque = T * t
     deck = _beamDeck(
-        "B33",
+        "BE3D2",
         (0, 0, 0),
         L * t,
         3,
-        f"profile=circle, d={d}, nFibers=4",
+        f"profile=circle, d={d}, nRings=2, nSectors=8",
         "3d",
         f""">>dirichlet, name=root, nSet=root, field=displacement, 1=0, 2=0, 3=0
 >>dirichlet, name=rootR, nSet=root, field=rotation, 1=0, 2=0, 3=0
@@ -166,14 +177,14 @@ def test_embedded_beam_follows_uniform_host_strain(tmp_path, rotations):
     along the axis, but is bent if tied to the host rotation (zero here), as the uniform strain rotates the inclined
     material line"""
     start, end = np.array([0.3, 0.2]), np.array([3.7, 0.8])
-    line, first, last = _line(100001, start, end, 5, "B23")
+    line, first, last = _line(100001, start, end, 5, "BE2D2")
     deck = (
         _strip()
         + f"""{line}
 *elSet, elSet=beams, generate=True
 {first}, {last - 1}, 1
 
-*section, name=beamSection, type=beam, area=1e-8, I=1e-8, material=steel
+*section, name=beamSection, type=beam, profile=generic, area=1e-8, I=1e-8, material=steel
 beams
 
 *constraint, type=embeddedRegion, name=embedded
@@ -213,15 +224,15 @@ maxInc=1.0, minInc=1e-8, maxNumInc=10, maxIter=10, stepLength=1
     assert np.abs(curvature).max() < 1e-4 * np.abs(curvatureOfHostRotation)
 
 
-@pytest.mark.parametrize("rotations", ["axis", "free"])
-def test_embedded_cantilever_clamped_in_stiff_block(tmp_path, rotations):
+@pytest.mark.parametrize("rotations, elType", [("axis", "BE2D2"), ("free", "BE2D2"), ("axis", "BE2D3")])
+def test_embedded_cantilever_clamped_in_stiff_block(tmp_path, rotations, elType):
     """a cantilever embedded with its root in a (practically rigid) block: with the rotations tied to the host, the
     free part deflects as a cantilever clamped at the block face, P L^3 / (3 E I); with free rotations the root is
     not clamped (only the nodal displacements are tied) and the beam deflects more"""
     b, h, L, P = 10.0, 10.0, 200.0, 1.0
     I = b * h**3 / 12  # noqa: E741
-    embedded, _, _ = _line(100001, (50.0, 50.0), (100.0, 50.0), 2, "B23")
-    free, _, tip = _line(100003, (100.0, 50.0), (100.0 + L, 50.0), 8, "B23")
+    embedded, _, _ = _line(100001, (50.0, 50.0), (100.0, 50.0), 2, elType)
+    free, _, tip = _line(100003, (100.0, 50.0), (100.0 + L, 50.0), 8, elType)
     free = free.replace("100003, 100, 50\n", "")  # the face node is the last node of the embedded part
     deck = (
         _strip(nX=4, nY=4, E=E_STEEL * 1e4, lX=100.0, lY=100.0)
@@ -261,14 +272,14 @@ maxInc=1.0, minInc=1e-8, maxNumInc=10, maxIter=10, stepLength=1
 
 
 def test_embedded_cantilever_clamped_in_stiff_block_3d(tmp_path):
-    """3D: a cantilever (B33) embedded in a stiff C3D8 block with tied rotations: biaxial bending and torsion of the
+    """3D: a cantilever (BE3D2) embedded in a stiff C3D8 block with tied rotations: biaxial bending and torsion of the
     free part as clamped at the block face"""
     b, h, L = 10.0, 20.0, 200.0
     Iz, Iy = b * h**3 / 12, h * b**3 / 12  # h along the local y axis (orientation (0, 1, 0)), b along z
     J = h * b**3 * (1 / 3 - 0.21 * b / h * (1 - b**4 / (12 * h**4)))
     Py, Pz, T = 1.0, 0.5, 20.0
-    embedded, _, _ = _line(100001, (50.0, 50.0, 50.0), (100.0, 50.0, 50.0), 2, "B33")
-    free, _, tip = _line(100003, (100.0, 50.0, 50.0), (100.0 + L, 50.0, 50.0), 6, "B33")
+    embedded, _, _ = _line(100001, (50.0, 50.0, 50.0), (100.0, 50.0, 50.0), 2, "BE3D2")
+    free, _, tip = _line(100003, (100.0, 50.0, 50.0), (100.0 + L, 50.0, 50.0), 6, "BE3D2")
     free = free.replace("100003, 100, 50, 50\n", "")
     deck = f"""*material, name=linearelastic, id=block, provider=marmot
 {E_STEEL * 1e4}, 0.2
@@ -296,7 +307,7 @@ gen_all
 *nSet, nSet=tip
 {tip}
 
-*section, name=beamSection, type=beam, profile=rectangle, b={b}, h={h}, n1x=0, n1y=1, n1z=0, nFibers=4, material=steel
+*section, name=beamSection, type=beam, profile=rectangle, b={b}, h={h}, n1x=0, n1y=1, n1z=0, nY=4, nZ=4, material=steel
 beams
 
 *constraint, type=embeddedRegion, name=embedded
@@ -361,14 +372,19 @@ maxInc=0.25, minInc=1e-8, maxNumInc=100, maxIter=10, stepLength=1
     )
 
 
-@pytest.mark.parametrize("generatorOptions", ["", "largeSlip=True\nmaxSlip=0.5"])
-def test_bond_slip_pull_out_beam_equals_truss(tmp_path, generatorOptions):
+@pytest.mark.parametrize(
+    "generatorOptions, beamType, trussType",
+    [("", "BE2D2", "TR2D2"), ("largeSlip=True\nmaxSlip=0.5", "BE2D2", "TR2D2"), ("", "BE2D3", "TR2D3")],
+)
+def test_bond_slip_pull_out_beam_equals_truss(tmp_path, generatorOptions, beamType, trussType):
     """axial pull-out of a beam with bond-slip (small and large slip) gives the force of a truss of the same area
     and the analytical F = E A beta tanh(beta L) u; the beam rotations stay zero"""
     A, Kt = 0.01, 1000.0
-    _, (FTruss,) = _run(tmp_path, _pullOutDeck(f"type=truss, area={A}", "TR2D2", f"{Kt}, 1e6", generatorOptions), "F")
+    _, (FTruss,) = _run(tmp_path, _pullOutDeck(f"type=truss, area={A}", trussType, f"{Kt}, 1e6", generatorOptions), "F")
     _, (FBeam,) = _run(
-        tmp_path, _pullOutDeck(f"type=beam, area={A}, I=1e-5", "B23", f"{Kt}, 1e6", generatorOptions), "F"
+        tmp_path,
+        _pullOutDeck(f"type=beam, profile=generic, area={A}, I=1e-5", beamType, f"{Kt}, 1e6", generatorOptions),
+        "F",
     )
     np.testing.assert_allclose(FBeam.getLastResult(), FTruss.getLastResult(), rtol=1e-9)
     EA = E_STEEL * A
@@ -378,11 +394,11 @@ def test_bond_slip_pull_out_beam_equals_truss(tmp_path, generatorOptions):
 
 def test_bond_slip_split_beams_match_perfect_bond(tmp_path):
     """an inclined beam in a strip bent by a transverse end displacement: with splitBars=True, the beam is re-meshed
-    with B23 elements at the host crossings, and a stiff bond converges to perfect bond (displacements tied, rotations
+    with BE2D2 elements at the host crossings, and a stiff bond converges to perfect bond (displacements tied, rotations
     free) of the split beam"""
 
     def deck(bondStiffness, perfectBond):
-        line, first, last = _line(100001, (0.3, 0.2), (3.7, 0.8), 3, "B23")
+        line, first, last = _line(100001, (0.3, 0.2), (3.7, 0.8), 3, "BE2D2")
         coupling = (
             "*constraint, type=embeddedRegion, name=embedded\nembeddedElSet=beams, hostElSet=gen_all"
             if perfectBond
@@ -394,7 +410,7 @@ def test_bond_slip_split_beams_match_perfect_bond(tmp_path):
 *elSet, elSet=beams, generate=True
 {first}, {last - 1}, 1
 
-*section, name=beamSection, type=beam, area=0.01, I=1e-4, material=steel
+*section, name=beamSection, type=beam, profile=generic, area=0.01, I=1e-4, material=steel
 beams
 
 *material, name=LinearElasticBondSlip, id=bond, provider=marmot
@@ -427,7 +443,7 @@ maxInc=1.0, minInc=1e-8, maxNumInc=10, maxIter=10, stepLength=1
     model, (uPerfect, rPerfect, hostPerfect) = _run(tmp_path, deck(0.0, True), "uBeam", "rBeam", "uHost")
     model, (uBond, rBond, hostBond) = _run(tmp_path, deck(1e10, False), "uBeam", "rBeam", "uHost")
     beams = model.elementSets["beams"]
-    assert len(beams) > 3 and all(el.elType == "B23" for el in beams)
+    assert len(beams) > 3 and all(el.elType == "BE2D2" for el in beams)
     np.testing.assert_allclose(uBond.getLastResult(), uPerfect.getLastResult(), atol=1e-6 * 0.01)
     np.testing.assert_allclose(hostBond.getLastResult(), hostPerfect.getLastResult(), atol=1e-6 * 0.01)
     # the rotations follow from the bending of the beam between the bond points; the finite bond stiffness shows most
@@ -475,3 +491,200 @@ def test_rotation_operator(shape, nDim):
             np.testing.assert_allclose(theta, [t[0] * (eps @ t)[1] - t[1] * (eps @ t)[0]], atol=1e-15)
         else:
             np.testing.assert_allclose(theta, np.cross(t, eps @ t), atol=1e-15)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# section points (edelweissfe.utils.beamsections)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _rectanglesIntegrals(rectangles):
+    """analytical A, Sy, Sz, Iy = int z^2, Iz = int y^2, Iyz of a union of rectangles (y0, y1, z0, z1)"""
+    c = dict.fromkeys(["A", "Sy", "Sz", "Iy", "Iz", "Iyz"], 0.0)
+    for y0, y1, z0, z1 in rectangles:
+        Y1, Y2, Y3 = y1 - y0, (y1**2 - y0**2) / 2, (y1**3 - y0**3) / 3
+        Z1, Z2, Z3 = z1 - z0, (z1**2 - z0**2) / 2, (z1**3 - z0**3) / 3
+        c["A"] += Y1 * Z1
+        c["Sy"] += Y2 * Z1
+        c["Sz"] += Y1 * Z2
+        c["Iy"] += Y1 * Z3
+        c["Iz"] += Y3 * Z1
+        c["Iyz"] += Y2 * Z2
+    return c
+
+
+def _check(points, expected, rtol=1e-12):
+    got = points.integrals()
+    scale = {"A": expected["A"], "Sy": 1.0, "Sz": 1.0}
+    for key, value in expected.items():
+        s = scale.get(key, max(expected.get("Iy", 1.0), expected.get("Iz", 1.0)))
+        if key in ("Sy", "Sz"):
+            s = expected["A"] * math.sqrt(max(expected.get("Iz", 1.0), 1.0) / expected["A"])
+        assert abs(got[key] - value) <= rtol * s, f"{key}: {got[key]} != {value}"
+
+
+@pytest.mark.parametrize(
+    "rule, n", [("gauss", 2), ("gauss", 5), ("lobatto", 3), ("lobatto", 6), ("simpson", 3), ("simpson", 7)]
+)
+def test_section_points_parametric_shapes_exact(rule, n):
+    """area and second moments of the parametric shapes are integrated exactly by every rule"""
+    from edelweissfe.utils import beamsections as bs
+
+    b, h = 10.0, 20.0
+    _check(bs.rectangle(b, h, n, n, rule), _rectanglesIntegrals([(-h / 2, h / 2, -b / 2, b / 2)]))
+    d, di = 30.0, 22.0
+    for inner in (0.0, di):
+        points = bs.tube(d, inner, n, 8, rule)
+        I = math.pi * (d**4 - inner**4) / 64  # noqa: E741
+        _check(points, {"A": math.pi * (d**2 - inner**2) / 4, "Sy": 0, "Sz": 0, "Iy": I, "Iz": I, "Iyz": 0})
+    H, B, tf, tw = 200.0, 100.0, 10.0, 6.0
+    rects = [
+        (H / 2 - tf, H / 2, -B / 2, B / 2),
+        (-H / 2, -H / 2 + tf, -B / 2, B / 2),
+        (-H / 2 + tf, H / 2 - tf, -tw / 2, tw / 2),
+    ]
+    _check(bs.iProfile(H, B, tf, tw, n, n, n, rule), _rectanglesIntegrals(rects))
+
+
+@pytest.mark.parametrize("order", [2, 4, 5])
+def test_section_points_polygons_exact(order, tmp_path):
+    """polygons: an L-profile (non-principal axes) and a hollow square (hole by the even-odd rule) from files"""
+    from edelweissfe.utils import beamsections as bs
+
+    a, b, t = 60.0, 40.0, 6.0
+    lLoop = [(0, 0), (0, b), (t, b), (t, t), (a, t), (a, 0)]  # (y, z): leg along y (length a), leg along z (b)
+    expected = _rectanglesIntegrals([(0, a, 0, t), (0, t, t, b)])
+    _check(bs.polygon([lLoop], meshSize=7.0, order=order), expected)
+
+    path = tmp_path / "square.txt"
+    path.write_text("# outer\n0 0\n50 0\n50 50\n0 50\n\n# hole\n10, 10\n10, 40\n40, 40\n40, 10\n")
+    hollow = bs.polygon(bs.readPolygon(str(path)), meshSize=5.0, order=order)
+    outer, inner = _rectanglesIntegrals([(0, 50, 0, 50)]), _rectanglesIntegrals([(10, 40, 10, 40)])
+    _check(hollow, {k: outer[k] - inner[k] for k in outer})
+
+
+@pytest.mark.parametrize("rule", ["gauss", "lobatto", "simpson"])
+def test_section_points_plastic_modulus_converges(rule):
+    """the plastic section modulus of the points, sum |y| A, converges to b h^2 / 4 for every rule"""
+    from edelweissfe.utils import beamsections as bs
+
+    b, h = 10.0, 20.0
+    errors = []
+    for n in (3, 7, 15, 31):
+        p = bs.rectangle(b, h, n, 1, rule)
+        errors.append(abs((np.abs(p.y) * p.area).sum() / (b * h * h / 4) - 1))
+    assert all(e1 < e0 for e0, e1 in zip(errors, errors[1:])), errors
+    assert errors[-1] < 2e-3, errors
+
+
+@pytest.mark.parametrize("rule, detects", [("lobatto", True), ("simpson", True), ("gauss", False)])
+def test_first_yield_detected_by_outer_fiber_points(tmp_path, rule, detects):
+    """a 2D cantilever under a tip moment (constant moment) with a perfectly plastic von Mises material: with points
+    on the outer fibers (lobatto, simpson), the first yield occurs exactly at the elastic limit moment
+    M_el = f_y b h^2 / 6; Gauss points lie inside and miss it"""
+    b, h, fy, L = 10.0, 20.0, 300.0, 100.0
+    Mel = fy * b * h * h / 6
+
+    def dissipation(M):
+        deck = _beamDeck(
+            "BE2D2",
+            (0, 0),
+            (L, 0),
+            2,
+            f"profile=rectangle, b={b}, h={h}, nY=5, nZ=1, rule={rule}",
+            "2d",
+            f""">>dirichlet, name=root, nSet=root, field=displacement, 1=0, 2=0
+>>dirichlet, name=rootR, nSet=root, field=rotation, 1=0
+>>nodeforces, name=M, nSet=tip, field=rotation, 1={M}
+""",
+        ).replace(
+            "linearelastic, id=steel, provider=marmot\n200000.0, 0.3",
+            f"VonMises, id=steel, provider=marmot\n200000.0, 0.3, {fy}, 0, 0, 1, 1e-9",
+        )
+        deck = deck.replace(
+            "*fieldOutput\n", "*fieldOutput\n>>perElement, name=D, elSet=beam, result=dissipation, quadraturePoint=0,\n"
+        )
+        _, (D,) = _run(tmp_path, deck, "D")
+        return float(np.abs(D.getLastResult()).max())
+
+    assert dissipation(0.999 * Mel) == 0.0
+    if detects:
+        assert dissipation(1.002 * Mel) > 0.0
+    else:
+        assert dissipation(1.002 * Mel) == 0.0
+
+
+def test_l_profile_polygon_cantilever_couples_bending(tmp_path):
+    """a 3D cantilever with an L-profile polygon section (centroid on the axis): a tip force along the local y axis,
+    which is not a principal axis, deflects the beam also along z, as from the analytical Iy, Iz, Iyz"""
+    a, b, t, L, P = 60.0, 40.0, 6.0, 400.0, 3.0
+    path = tmp_path / "L.txt"
+    path.write_text("0 0\n0 40\n6 40\n6 6\n60 6\n60 0\n")
+    c = _rectanglesIntegrals([(0, a, 0, t), (0, t, t, b)])
+    yc, zc = c["Sy"] / c["A"], c["Sz"] / c["A"]
+    Iy, Iz, Iyz = c["Iy"] - c["A"] * zc**2, c["Iz"] - c["A"] * yc**2, c["Iyz"] - c["A"] * yc * zc
+    deck = _beamDeck(
+        "BE3D2",
+        (0, 0, 0),
+        (L, 0, 0),
+        4,
+        f"profile=polygon, polygonFile={path}, meshSize=6, J=5000, n1x=0, n1y=1, n1z=0",
+        "3d",
+        f""">>dirichlet, name=root, nSet=root, field=displacement, 1=0, 2=0, 3=0
+>>dirichlet, name=rootR, nSet=root, field=rotation, 1=0, 2=0, 3=0
+>>nodeforces, name=P, nSet=tip, field=displacement, 2={P}
+""",
+    )
+    _, (u,) = _run(tmp_path, deck, "u")
+    u = u.getLastResult().ravel()
+    # [My, Mz] = E [[Iy, -Iyz], [-Iyz, Iz]] [kappa_y, kappa_z] with My = 0, Mz = P (L - x)
+    kappa = np.linalg.solve(E_STEEL * np.array([[Iy, -Iyz], [-Iyz, Iz]]), [0.0, P])
+    np.testing.assert_allclose(u[1], kappa[1] * L**3 / 3, rtol=1e-9)
+    np.testing.assert_allclose(u[2], -kappa[0] * L**3 / 3, rtol=1e-9)
+    assert abs(u[2]) > 0.1 * abs(u[1])  # the coupling is substantial
+
+
+def test_composite_section_by_overlapping_elements(tmp_path):
+    """one material per element: a steel tube filled with concrete as two beam elements on the same nodes; the
+    cantilever deflection is P L^3 / (3 (E_s I_s + E_c I_c))"""
+    d, di, L, P = 100.0, 90.0, 1000.0, 50.0
+    line, first, last = _line(1, (0, 0), (L, 0), 4, "BE2D2")
+    core = "\n".join(f"{100 + i}, {first + i}, {first + i + 1}" for i in range(4))
+    deck = f"""*material, name=linearelastic, id=steel, provider=marmot
+{E_STEEL}, 0.3
+*material, name=linearelastic, id=concrete, provider=marmot
+{E_CONCRETE}, 0.2
+
+{line}
+*element, type=BE2D2
+{core}
+
+*elSet, elSet=tube, generate=True
+{first}, {last - 1}, 1
+*elSet, elSet=core, generate=True
+100, 103, 1
+*nSet, nSet=root
+{first}
+*nSet, nSet=tip
+{last}
+
+*section, name=tubeSection, type=beam, profile=tube, d={d}, di={di}, nRings=2, nSectors=12, material=steel
+tube
+*section, name=coreSection, type=beam, profile=circle, d={di}, nRings=3, nSectors=12, material=concrete
+core
+
+*job, name=job, domain=2d
+*solver, solver=NIST, name=theSolver
+
+*fieldOutput
+>>perNode, name=u, nSet=tip, field=displacement, result=U, saveHistory=True,
+
+*step, solver=theSolver
+maxInc=1.0, minInc=1e-8, maxNumInc=10, maxIter=10, stepLength=1
+>>dirichlet, name=root, nSet=root, field=displacement, 1=0, 2=0
+>>dirichlet, name=rootR, nSet=root, field=rotation, 1=0
+>>nodeforces, name=P, nSet=tip, field=displacement, 2={P}
+"""
+    _, (u,) = _run(tmp_path, deck, "u")
+    EI = E_STEEL * math.pi * (d**4 - di**4) / 64 + E_CONCRETE * math.pi * di**4 / 64
+    np.testing.assert_allclose(u.getLastResult().ravel()[1], P * L**3 / (3 * EI), rtol=1e-10)

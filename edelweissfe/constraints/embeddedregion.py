@@ -41,7 +41,7 @@ stiffness, which is added to the host's (the volume of the embedded material is 
 For bond-slip instead of perfect bond, see the ``embeddedBond`` generator
 (:mod:`edelweissfe.generators.embeddedbond`).
 
-Embedded beams (elements with a ``rotation`` field, e.g., Marmot ``B23``/``B33``): their displacements are tied
+Embedded beams (elements with a ``rotation`` field, e.g., Marmot ``BE2D2``, ``BE3D3``): their displacements are tied
 as above. Their rotations are left free by default (``rotations=free``): the beam then resists bending only by the
 tied displacements of its nodes, i.e., by the curvature of its nodal polygon. With ``rotations=axis``, the rotation
 of an embedded beam node is tied to the rotation of the host material line along the beam axis
@@ -223,10 +223,10 @@ class Constraint(MultiPointConstraintBase):
         # the axes of the beam elements (with a rotation field) at each of their nodes
         beamAxes = {}
         for el in embeddedElements:
-            if self._rotationMode != "free" and el.ensightType == "bar2" and "rotation" in el.fields[0]:
+            if self._rotationMode != "free" and el.ensightType in ("bar2", "bar3") and "rotation" in el.fields[0]:
                 X = np.array([n.coordinates for n in el.nodes[:2]], dtype=float)
                 t = (X[1] - X[0]) / np.linalg.norm(X[1] - X[0])
-                for node in el.nodes[:2]:
+                for node in el.nodes:
                     beamAxes.setdefault(node, []).append(t)
 
         embeddedNodes = list(dict.fromkeys(n for el in embeddedElements for n in el.nodes))

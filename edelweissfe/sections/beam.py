@@ -26,24 +26,34 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 """
-A section for beam elements, e.g., the Marmot Euler-Bernoulli beams ``B23`` (2D) and ``B33`` (3D), assigning the
-cross section and the fiber layout of the section integration.
+A section for beam elements, e.g., the Marmot Euler-Bernoulli beams ``BE2D2``, ``BE2D3``, ``BE3D2``, ``BE3D3``,
+which integrate their cross section over section points with one material instance per point (any Marmot
+hypoelastic material). This section generates the points (see :mod:`edelweissfe.utils.beamsections`) and passes
+them, with the orientation and the torsion constant, as element properties.
 
-The cross section is given either by its profile dimensions (``profile=rectangle`` with ``b`` and ``h``,
-``profile=circle`` with ``d``), or by its section constants (``profile=generic`` with ``area``, ``I`` (2D) or
-``Iy``, ``Iz``, ``J`` (3D)); constants given explicitly override those computed from the dimensions. The local
-:math:`y` axis of the section lies in the plane of a 2D beam; in 3D it is the part of the orientation vector
-``(n1x, n1y, n1z)`` normal to the beam axis, and :math:`z = x \\times y`. ``h`` is the height along :math:`y`, ``b``
-the width along :math:`z` (2D: out of plane), :math:`I_z = \\int y^2 \\mathrm{d}A` (bending in the
-:math:`x`-:math:`y` plane, the in-plane bending of a 2D beam), :math:`I_y = \\int z^2 \\mathrm{d}A`.
+Profiles (``profile=``):
 
-The section is integrated with fibers of the beam's material (any Marmot hypoelastic material), which reproduce
-the section constants exactly: ``generic`` uses the fewest fibers (2 in 2D, 4 in 3D; an idealized sandwich section
-for inelastic materials), ``rectangle`` a grid of ``nFibers`` (x ``nFibers`` in 3D) fibers and ``circle`` rings and
-sectors (see the Marmot documentation of the beam element).
+* ``rectangle`` (``b`` along z, ``h`` along y; ``nY`` x ``nZ`` points),
+* ``circle`` (``d``) and ``tube`` (``d``, ``di``; ``nRings`` x ``nSectors`` points),
+* ``iprofile`` (``h``, ``b``, ``tf``, ``tw``; ``nY`` points along the web, ``nZ`` across a flange, ``nT`` through a
+  flange or the web thickness),
+* ``polygon`` (``polygonFile``: vertices ``y, z`` per line, loops separated by empty lines, holes by the even-odd
+  rule; ``meshSize``, ``triangleOrder``),
+* ``points`` (``pointsFile``: ``y, z, area`` per line, or ``y, area``),
+* ``generic`` (``area``, ``Iz`` (2D: also ``I``), 3D: ``Iy``; 2 or 4 points reproducing them).
 
-Without an orientation vector in 3D, :math:`(0, 0, 1)` is used, or :math:`(0, 1, 0)` for beams (almost) parallel
-to the global :math:`z` axis.
+The 1D rule of the parametric profiles is ``rule=gauss|lobatto|simpson`` (lobatto and simpson place points on the
+outer fibers, which detects the first yield exactly). The torsion constant ``J`` (3D) is computed for rectangles
+(Roark), circles and tubes (exact) and I-profiles (thin-walled, :math:`\\sum b t^3 / 3`); it is required for the
+other profiles. With ``centroidAtAxis=True`` (default) the points are shifted such that their centroid lies on the
+beam axis (the line through the nodes); otherwise the given coordinates are measured from the axis (an eccentric
+beam). The local y axis lies in the plane of a 2D beam; in 3D it is the part of the orientation vector ``(n1x, n1y,
+n1z)`` normal to the beam axis, and :math:`z = x \\times y`. Without an orientation vector, :math:`(0, 0, 1)` is
+used, or :math:`(0, 1, 0)` for beams (almost) parallel to the global z axis. In 2D, the z coordinates of the points
+are dropped (use ``nZ=1`` for rectangles).
+
+One material per element: a composite section (e.g., steel and concrete) is modeled by several beam elements on
+the same nodes, one per material, each with its part of the section (the fiber integration is additive).
 
 .. code-block:: edelweiss
     :caption: Example:
@@ -51,7 +61,7 @@ to the global :math:`z` axis.
     *material, name=VonMises, id=steel, provider=marmot
         200000, 0.3, 500, 1000, 0, 1, 7.85e-9
 
-    *section, name=pileSection, type=beam, profile=circle, d=300, nFibers=8, material=steel
+    *section, name=pile, type=beam, profile=tube, d=300, di=260, nRings=3, nSectors=16, rule=lobatto, material=steel
         piles
 """
 
@@ -63,10 +73,11 @@ from edelweissfe.sections.base.sectionbase import MaterialParameterFromFieldSche
 from edelweissfe.sections.base.sectionbase import Section as SectionBase
 from edelweissfe.sections.base.sectionbase import WriteMaterialPropertiesToFileSchema
 from edelweissfe.sets.elementset import ElementSet
+from edelweissfe.utils import beamsections
 from edelweissfe.utils.schema import datalineField, schemaField, subKeywordField
 
-#: The profile codes of the Marmot beam elements.
-PROFILE_CODES = {"generic": 0, "rectangle": 1, "circle": 2}
+#: The profiles of the beam section.
+PROFILES = ("rectangle", "circle", "tube", "iprofile", "polygon", "points", "generic")
 
 
 def rectangleTorsionConstant(b: float, h: float) -> float:
@@ -79,21 +90,47 @@ def rectangleTorsionConstant(b: float, h: float) -> float:
 class BeamSectionSchema:
     """The options this section accepts, owned by this module and never mutated from outside it."""
 
-    profile: str = schemaField(
-        description="The cross section profile: 'generic' (section constants only), 'rectangle' or 'circle'.",
+    profile: str = schemaField(description=f"The cross section profile, one of {PROFILES}.", dtype=str, default=None)
+    rule: str = schemaField(
+        description="The 1D rule of the section points of parametric profiles: gauss, lobatto or simpson.",
         dtype=str,
-        default="generic",
+        default="gauss",
     )
-    b: float | None = schemaField(description="rectangle: width along the local z axis", dtype=float, default=None)
-    h: float | None = schemaField(description="rectangle: height along the local y axis", dtype=float, default=None)
-    d: float | None = schemaField(description="circle: diameter", dtype=float, default=None)
-    area: float | None = schemaField(description="cross section area", dtype=float, default=None)
+    b: float | None = schemaField(description="rectangle, iprofile: width along z", dtype=float, default=None)
+    h: float | None = schemaField(description="rectangle, iprofile: height along y", dtype=float, default=None)
+    d: float | None = schemaField(description="circle, tube: (outer) diameter", dtype=float, default=None)
+    di: float = schemaField(description="tube: inner diameter", dtype=float, default=0.0)
+    tf: float | None = schemaField(description="iprofile: flange thickness", dtype=float, default=None)
+    tw: float | None = schemaField(description="iprofile: web thickness", dtype=float, default=None)
+    nY: int = schemaField(description="rectangle, iprofile (web): points along y", dtype=int, default=5)
+    nZ: int = schemaField(
+        description="rectangle, iprofile (flange width): points along z (default: 5 in 3D, 1 in 2D)",
+        dtype=int,
+        default=0,
+    )
+    nT: int = schemaField(description="iprofile: points through a flange or the web thickness", dtype=int, default=2)
+    nRings: int = schemaField(description="circle, tube: points in the radial direction", dtype=int, default=3)
+    nSectors: int = schemaField(
+        description="circle, tube: points in the circumferential direction", dtype=int, default=8
+    )
+    polygonFile: str | None = schemaField(description="polygon: the file of the loops", dtype=str, default=None)
+    meshSize: float | None = schemaField(description="polygon: the largest cell size", dtype=float, default=None)
+    triangleOrder: int = schemaField(description="polygon: the degree of the triangle rule", dtype=int, default=2)
+    pointsFile: str | None = schemaField(description="points: the file of the points", dtype=str, default=None)
+    area: float | None = schemaField(description="generic: cross section area", dtype=float, default=None)
     I: float | None = schemaField(  # noqa: E741
-        description="2D: second moment of area for bending in the plane (synonym of Iz)", dtype=float, default=None
+        description="generic, 2D: second moment of area for bending in the plane (synonym of Iz)",
+        dtype=float,
+        default=None,
     )
-    Iy: float | None = schemaField(description="3D: second moment of area int z^2 dA", dtype=float, default=None)
-    Iz: float | None = schemaField(description="second moment of area int y^2 dA", dtype=float, default=None)
-    J: float | None = schemaField(description="3D: torsion constant", dtype=float, default=None)
+    Iy: float | None = schemaField(description="generic, 3D: int z^2 dA", dtype=float, default=None)
+    Iz: float | None = schemaField(description="generic: int y^2 dA", dtype=float, default=None)
+    J: float | None = schemaField(
+        description="3D: torsion constant (overrides the computed one)", dtype=float, default=None
+    )
+    centroidAtAxis: bool = schemaField(
+        description="Shift the section points such that their centroid lies on the beam axis.", dtype=bool, default=True
+    )
     n1x: float | None = schemaField(
         description="3D: orientation vector of the local y axis, x", dtype=float, default=None
     )
@@ -102,9 +139,6 @@ class BeamSectionSchema:
     )
     n1z: float | None = schemaField(
         description="3D: orientation vector of the local y axis, z", dtype=float, default=None
-    )
-    nFibers: int = schemaField(
-        description="rectangle and circle: the number of fibers per direction", dtype=int, default=8
     )
     materialParameterFromField: tuple[MaterialParameterFromFieldSchema, ...] = subKeywordField(
         description="use material properties given by an analytical field",
@@ -119,42 +153,53 @@ class BeamSectionSchema:
     )
 
 
-def sectionConstants(configuration: BeamSectionSchema) -> dict:
-    """The section constants ``area``, ``Iy``, ``Iz``, ``J`` of a beam section definition.
+def sectionPoints(c: BeamSectionSchema, nDim: int) -> tuple[beamsections.SectionPoints, float | None]:
+    """The section points and the torsion constant (``None`` if unknown) of a beam section definition."""
 
-    Raises
-    ------
-    ValueError
-        If the profile is unknown or a dimension or constant is missing.
-    """
-    profile = configuration.profile.lower()
-    if profile not in PROFILE_CODES:
-        raise ValueError(f"Unknown beam profile '{configuration.profile}', use one of {list(PROFILE_CODES)}.")
+    def need(*names):
+        missing = [n for n in names if getattr(c, n) is None]
+        if missing:
+            raise ValueError(f"A beam section of profile '{c.profile}' requires {missing}.")
 
-    constants = {"area": None, "Iy": None, "Iz": None, "J": None}
+    profile = (c.profile or "").lower()
+    nZ = c.nZ or (5 if nDim == 3 else 1)
+    J = None
     if profile == "rectangle":
-        b, h = configuration.b, configuration.h
-        if b is None or h is None:
-            raise ValueError("A rectangle beam section requires b and h.")
-        constants = {"area": b * h, "Iy": h * b**3 / 12, "Iz": b * h**3 / 12, "J": rectangleTorsionConstant(b, h)}
-    elif profile == "circle":
-        d = configuration.d
-        if d is None:
-            raise ValueError("A circle beam section requires d.")
-        constants = {"area": np.pi * d**2 / 4, "Iy": np.pi * d**4 / 64, "Iz": np.pi * d**4 / 64, "J": np.pi * d**4 / 32}
+        need("b", "h")
+        points = beamsections.rectangle(c.b, c.h, c.nY, nZ, c.rule)
+        J = rectangleTorsionConstant(c.b, c.h)
+    elif profile in ("circle", "tube"):
+        need("d")
+        di = c.di if profile == "tube" else 0.0
+        points = beamsections.tube(c.d, di, c.nRings, c.nSectors, c.rule)
+        J = np.pi * (c.d**4 - di**4) / 32
+    elif profile == "iprofile":
+        need("h", "b", "tf", "tw")
+        points = beamsections.iProfile(c.h, c.b, c.tf, c.tw, c.nY, nZ, c.nT, c.rule)
+        J = (2 * c.b * c.tf**3 + (c.h - 2 * c.tf) * c.tw**3) / 3
+    elif profile == "polygon":
+        need("polygonFile")
+        points = beamsections.polygon(beamsections.readPolygon(c.polygonFile), c.meshSize, c.triangleOrder)
+    elif profile == "points":
+        need("pointsFile")
+        points = beamsections.readPoints(c.pointsFile)
+    elif profile == "generic":
+        Iz = c.Iz if c.Iz is not None else c.I
+        if c.area is None or Iz is None or (nDim == 3 and c.Iy is None):
+            raise ValueError("A generic beam section requires area and Iz (or I), and Iy in 3D.")
+        points = beamsections.genericPoints(c.area, c.Iy if nDim == 3 else 0.0, Iz)
+    else:
+        raise ValueError(f"Unknown beam profile '{c.profile}', use one of {PROFILES}.")
 
-    given = {
-        "area": configuration.area,
-        "Iy": configuration.Iy,
-        "Iz": configuration.Iz if configuration.Iz is not None else configuration.I,
-        "J": configuration.J,
-    }
-    constants.update({k: v for k, v in given.items() if v is not None})
-    return constants
+    if c.centroidAtAxis:
+        points = points.centered()
+    if c.J is not None:
+        J = c.J
+    return points, J
 
 
 class Section(SectionBase):
-    """A section for beam elements, assigning the cross section constants, the profile and the orientation."""
+    """A section for beam elements, assigning the section points, the orientation and the torsion constant."""
 
     #: Option schema for this section, per OptionSchemaProvider.
     schema = BeamSectionSchema
@@ -193,16 +238,9 @@ class Section(SectionBase):
         )
         self.name = name
         self.nDim = model.domainSize
-        self.profileCode = PROFILE_CODES.get(configuration.profile.lower())
-        self.constants = sectionConstants(configuration)
-        self.nFibers = configuration.nFibers
-
-        required = ["area", "Iz"] if self.nDim == 2 else ["area", "Iy", "Iz", "J"]
-        missing = [k for k in required if self.constants[k] is None]
-        if missing:
-            raise ValueError(f"Beam section {name}: missing section constants {missing}.")
-        if any(self.constants[k] <= 0 for k in required):
-            raise ValueError(f"Beam section {name}: the section constants must be positive.")
+        self.points, self.J = sectionPoints(configuration, self.nDim)
+        if self.nDim == 3 and (self.J is None or self.J <= 0):
+            raise ValueError(f"Beam section {name}: a positive torsion constant J is required for this profile in 3D.")
 
         n1 = (configuration.n1x, configuration.n1y, configuration.n1z)
         if any(c is not None for c in n1):
@@ -214,9 +252,9 @@ class Section(SectionBase):
 
     def elementProperties(self, element) -> np.ndarray:
         """The Marmot element properties of a beam element of this section."""
-        c = self.constants
+        p = self.points
         if self.nDim == 2:
-            return np.array([c["area"], c["Iz"], self.profileCode, self.nFibers], dtype=float)
+            return np.concatenate([[len(p)], np.column_stack([p.y, p.area]).ravel()])
 
         n1 = self.orientation
         if n1 is None:
@@ -224,15 +262,15 @@ class Section(SectionBase):
             axis = coordinates[1] - coordinates[0]
             axis /= np.linalg.norm(axis)
             n1 = np.array([0.0, 0.0, 1.0]) if abs(axis[2]) < 0.99 else np.array([0.0, 1.0, 0.0])
-        return np.array([c["area"], c["Iy"], c["Iz"], c["J"], *n1, self.profileCode, self.nFibers], dtype=float)
+        return np.concatenate([n1, [self.J, len(p)], np.column_stack([p.y, p.z, p.area]).ravel()])
 
     def assignSectionPropertiesToElement(self, element, **kwargs):
         material = kwargs.get("material", self.material)
 
-        if element.ensightType != "bar2" or "rotation" not in element.fields[0]:
+        if element.ensightType not in ("bar2", "bar3") or "rotation" not in element.fields[0]:
             raise Exception(f"Beam section is incompatible with element {element.elNumber} ({element.elType}).")
 
-        element.setProperties(self.elementProperties(element))
+        element.setProperties(np.asarray(self.elementProperties(element), dtype=float))
         element.initializeElement()
         if not isinstance(material, dict):
             raise Exception(f"Beam section {self.name}: beam elements require a Marmot material.")

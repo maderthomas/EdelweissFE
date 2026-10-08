@@ -15,6 +15,11 @@ Relevant module: ``edelweissfe.config.sections``
 .. pprint:: section:beam
    :caption: Options:
 
+Section points (module ``edelweissfe.utils.beamsections``):
+
+.. automodule:: edelweissfe.utils.beamsections
+   :members: __doc__, lineRule, rectangle, tube, iProfile, polygon, genericPoints, readPoints, readPolygon
+
 ``truss`` - Truss (bar) elements
 --------------------------------
 

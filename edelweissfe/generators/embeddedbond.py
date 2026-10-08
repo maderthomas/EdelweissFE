@@ -36,7 +36,7 @@ element transfers the bond stress of a pluggable bond-slip law (e.g., ``LINEAREL
 
 Parts of a bar lying outside of all host elements (e.g., a free end of a pull-out specimen) remain unbonded.
 
-The bars may also be beam elements (e.g., Marmot ``B23``, ``B33``, reported as ``bar2``): the bond elements couple
+The bars may also be beam elements (e.g., Marmot ``BE2D2``, ``BE3D3``, reported as ``bar2``/``bar3``): the bond elements couple
 only their displacement field, the beam rotations are not coupled to the host (as for ``rotations=free`` of the
 embedded region constraint), and the bond sees the linear interpolation of the beam axis between its nodes, not the
 beam's cubic deflection -- use ``splitBars=True`` (or a beam mesh finer than the host) for bent beams. Split beams

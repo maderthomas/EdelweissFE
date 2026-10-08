@@ -1,4 +1,4 @@
-** a steel cantilever (B33, 20 x 10 rectangle, h = 20 along the local y axis = global y) embedded with its root in
+** a steel cantilever (BE3D2, 20 x 10 rectangle, h = 20 along the local y axis = global y) embedded with its root in
 ** a practically rigid block (C3D8); rotations tied to the host (rotations=axis); tip forces Py = 1, Pz = 0.5 and
 ** torque T = 20 on the 200 mm free part: u_y = Py L^3 / (3 E Iz) = 2e-3, u_z = Pz L^3 / (3 E Iy) = 4e-3,
 ** twist = T L / (G J)
@@ -25,7 +25,7 @@ gen_all
 100002, 75, 50, 50
 100003, 100, 50, 50
 
-*element, type=B33
+*element, type=BE3D2
 100001, 100001, 100002
 100002, 100002, 100003
 
@@ -37,7 +37,7 @@ gen_all
 100008, 266.666666667, 50, 50
 100009, 300, 50, 50
 
-*element, type=B33
+*element, type=BE3D2
 100003, 100003, 100004
 100004, 100004, 100005
 100005, 100005, 100006
@@ -51,7 +51,7 @@ gen_all
 *nSet, nSet=tip
 100009
 
-*section, name=beamSection, type=beam, profile=rectangle, b=10, h=20, n1x=0, n1y=1, n1z=0, nFibers=4, material=steel
+*section, name=beamSection, type=beam, profile=rectangle, b=10, h=20, n1x=0, n1y=1, n1z=0, nY=4, nZ=4, material=steel
 beams
 
 *constraint, type=embeddedRegion, name=embedded

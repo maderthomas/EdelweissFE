@@ -1,5 +1,5 @@
-** a laterally loaded steel pile (B23, 12 elements, 200 x 200 rectangle, 10 fibers, von Mises) in a soil block (CPE4, 2000 x 3000);
-** bond-slip coupling by the embeddedBond generator (linear bond law, splitBars=True: the pile is re-meshed with B23
+** a laterally loaded steel pile (BE2D2, 12 elements, 200 x 200 rectangle, 10 Lobatto points, von Mises) in a soil block (CPE4, 2000 x 3000);
+** bond-slip coupling by the embeddedBond generator (linear bond law, splitBars=True: the pile is re-meshed with BE2D2
 ** elements at the host element boundaries); the pile head sticks out 500 mm and is pushed laterally by 60 mm, the
 ** pile yields in bending
 *material, name=linearelastic, id=soil, provider=marmot
@@ -38,7 +38,7 @@ gen_all
 100012, 1060, 3300
 100013, 1060, 3500
 
-*element, type=B23
+*element, type=BE2D2
 100001, 100001, 100002
 100002, 100002, 100003
 100003, 100003, 100004
@@ -58,7 +58,7 @@ gen_all
 *nSet, nSet=pileHead
 100013
 
-*section, name=pileSection, type=beam, profile=rectangle, b=200, h=200, nFibers=10, material=steel
+*section, name=pileSection, type=beam, profile=rectangle, b=200, h=200, nY=10, nZ=1, rule=lobatto, material=steel
 pile
 
 *modelGenerator, generator=embeddedBond, name=pileBond, executeAfterManualGeneration=True

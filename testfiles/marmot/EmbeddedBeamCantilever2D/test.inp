@@ -1,4 +1,4 @@
-** a steel cantilever (B23, 10 x 10 rectangle, fiber section) embedded with its root (2 elements, 50 mm) in a
+** a steel cantilever (BE2D2, 10 x 10 rectangle, 5 Gauss points) embedded with its root (2 elements, 50 mm) in a
 ** practically rigid block (CPE4, E = 2.1e9); perfect bond by the embedded region constraint with the beam rotations
 ** tied to the rotation of the host material line along the axis (rotations=axis); the 200 mm free part deflects as
 ** a cantilever clamped at the block face: tip deflection P L^3 / (3 E I) = 0.0152381
@@ -23,7 +23,7 @@ gen_all
 100002, 75, 50
 100003, 100, 50
 
-*element, type=B23
+*element, type=BE2D2
 100001, 100001, 100002
 100002, 100002, 100003
 
@@ -37,7 +37,7 @@ gen_all
 100010, 275, 50
 100011, 300, 50
 
-*element, type=B23
+*element, type=BE2D2
 100003, 100003, 100004
 100004, 100004, 100005
 100005, 100005, 100006
