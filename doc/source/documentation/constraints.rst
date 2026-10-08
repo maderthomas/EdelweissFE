@@ -490,6 +490,29 @@ Module ``edelweissfe.constraints.hangingnode``
     :language: edelweiss
     :caption: Example (static 2:1 patch test): ``testfiles/marmot/AMR_PatchTestU/test.inp``
 
+``embeddedregion`` - Embedded elements (perfect bond of reinforcement)
+----------------------------------------------------------------------
+
+Ties every node of the embedded elements (e.g., truss elements of reinforcement bars, meshed independently of the
+host) to the host continuum element it lies in, :math:`u_s = \sum_a N_a(\xi_s)\, u_{a}`, by master-slave DOF
+elimination, like Abaqus' ``*EMBEDDED ELEMENT``. For bond-slip, see the ``embeddedbond`` generator in
+:doc:`generators`.
+
+The nodal ``P`` of an embedded (slave) node is reported on the slave node itself, before condensation: a reaction
+summed over a node set must include the embedded nodes on that boundary.
+
+Module ``edelweissfe.constraints.embeddedregion``
+
+.. automodule:: edelweissfe.constraints.embeddedregion
+    :members: __doc__
+
+.. pprint:: constraint:embeddedregion
+    :caption: Options:
+
+.. literalinclude:: ../../../testfiles/marmot/EmbeddedRegionRebar2D/test.inp
+    :language: edelweiss
+    :caption: Example: ``testfiles/marmot/EmbeddedRegionRebar2D/test.inp``
+
 Implementing your own constraints
 ---------------------------------
 
