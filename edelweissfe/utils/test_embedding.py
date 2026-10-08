@@ -154,3 +154,20 @@ def test_split_bar_starting_on_host_boundary_has_no_degenerate_parts(start, end)
     assert unembedded == 0.0
     assert all(p.etaEnd - p.etaStart > 1e-6 for p in parts)
     assert parts[0].etaStart == -1.0 and parts[-1].etaEnd == 1.0
+
+
+@pytest.mark.parametrize("barShape", ["bar2", "bar3"])
+def test_split_bar_through_mesh_corners_has_no_slivers(barShape):
+    """a bar at 45 degrees through the nodes of a structured grid touches the side neighbors only at the corners: no
+    sliver parts, and the parts tile the bar"""
+    hosts = _quadGrid(6, 6, 6.0, 6.0)
+    locator = HostElementLocator(hosts)
+    a, b = np.array([0.5, 0.5]), np.array([5.5, 5.5])  # through the grid nodes (1,1), (2,2), ...
+    barNodes = [_node(100, a), _node(101, b)] + ([_node(102, 0.5 * (a + b))] if barShape == "bar3" else [])
+    parts, unembedded = splitBarElementAtHostBoundaries(_element(1000, barShape, barNodes), locator)
+    assert unembedded == 0.0
+    assert all(p.etaEnd - p.etaStart > 1e-3 for p in parts)
+    assert [p.hostElement.elNumber for p in parts] == [0, 7, 14, 21, 28, 35]  # the diagonal cells
+    assert parts[0].etaStart == -1.0 and parts[-1].etaEnd == 1.0
+    for p, q in zip(parts[:-1], parts[1:]):
+        assert p.etaEnd == q.etaStart

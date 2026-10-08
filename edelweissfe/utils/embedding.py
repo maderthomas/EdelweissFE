@@ -268,4 +268,25 @@ def splitBarElementAtHostBoundaries(barElement, locator: HostElementLocator, sam
         eta = etaExit if (newHost is not None and progress) else etaNext
         host = newHost
 
-    return parts, unembedded
+    return _removeSlivers(parts), unembedded
+
+
+#: Parts of a bar element shorter than this (in its parametric coordinate, of length 2) are slivers, e.g., where a bar
+#: passes exactly through a corner of the host mesh and touches a neighbor only within the tolerance of the search.
+MIN_PART_LENGTH = 1e-6
+
+
+def _removeSlivers(parts: list) -> list:
+    """Drop sliver parts and close the gaps they leave between adjacent parts, so that the remaining parts still tile
+    the embedded stretches of the bar."""
+    kept = []
+    for part in parts:
+        if part.etaEnd - part.etaStart < MIN_PART_LENGTH:
+            continue
+        if kept and part.etaStart - kept[-1].etaEnd < MIN_PART_LENGTH:
+            # adjacent (up to a dropped sliver or the search tolerance): meet in the middle
+            middle = 0.5 * (kept[-1].etaEnd + part.etaStart)
+            kept[-1] = BarPart(kept[-1].barElement, kept[-1].hostElement, kept[-1].etaStart, middle)
+            part = BarPart(part.barElement, part.hostElement, middle, part.etaEnd)
+        kept.append(part)
+    return kept

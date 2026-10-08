@@ -84,6 +84,7 @@ from edelweissfe.utils.embedding import (
     HostElementLocator,
     barGeometry,
     barLength,
+    MIN_PART_LENGTH,
     barPoint,
     splitBarElementAtHostBoundaries,
 )
@@ -329,7 +330,7 @@ def _splitBarAtHostBoundaries(bar, locator: HostElementLocator, model: FEModel) 
     # break points: the boundaries of the embedded parts, including those to unembedded stretches
     breakPoints = [-1.0]
     for eta in sorted([p.etaStart for p in parts] + [p.etaEnd for p in parts] + [1.0]):
-        if eta - breakPoints[-1] > 1e-9:
+        if eta - breakPoints[-1] > MIN_PART_LENGTH:
             breakPoints.append(eta)
     breakPoints[-1] = 1.0
     if len(breakPoints) == 2:
