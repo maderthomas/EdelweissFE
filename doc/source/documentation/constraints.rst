@@ -493,8 +493,8 @@ Module ``edelweissfe.constraints.hangingnode``
 ``embeddedregion`` - Embedded elements (perfect bond of reinforcement)
 ----------------------------------------------------------------------
 
-Ties every node of the embedded elements (e.g., truss elements of reinforcement bars, meshed independently of the
-host) to the host continuum element it lies in, :math:`u_s = \sum_a N_a(\xi_s)\, u_{a}`, by master-slave DOF
+Ties every node of the embedded elements (e.g., truss or beam elements of reinforcement bars or structural members,
+meshed independently of the host) to the host continuum element it lies in, :math:`u_s = \sum_a N_a(\xi_s)\, u_{a}`, by master-slave DOF
 elimination, like Abaqus' ``*EMBEDDED ELEMENT``. For bond-slip, see the ``embeddedbond`` generator in
 :doc:`generators`.
 
@@ -512,6 +512,10 @@ Module ``edelweissfe.constraints.embeddedregion``
 .. literalinclude:: ../../../testfiles/marmot/EmbeddedRegionRebar2D/test.inp
     :language: edelweiss
     :caption: Example: ``testfiles/marmot/EmbeddedRegionRebar2D/test.inp``
+
+.. literalinclude:: ../../../testfiles/marmot/EmbeddedBeamCantilever2D/test.inp
+    :language: edelweiss
+    :caption: Example (embedded beam, rotations tied): ``testfiles/marmot/EmbeddedBeamCantilever2D/test.inp``
 
 Implementing your own constraints
 ---------------------------------

@@ -36,6 +36,12 @@ element transfers the bond stress of a pluggable bond-slip law (e.g., ``LINEAREL
 
 Parts of a bar lying outside of all host elements (e.g., a free end of a pull-out specimen) remain unbonded.
 
+The bars may also be beam elements (e.g., Marmot ``BE2D2``, ``BE3D3``, reported as ``bar2``/``bar3``): the bond elements couple
+only their displacement field, the beam rotations are not coupled to the host (as for ``rotations=free`` of the
+embedded region constraint), and the bond sees the linear interpolation of the beam axis between its nodes, not the
+beam's cubic deflection -- use ``splitBars=True`` (or a beam mesh finer than the host) for bent beams. Split beams
+get the type and the section of the original beam.
+
 With ``splitBars=True``, every bar element crossing host element boundaries is first replaced by bar elements
 (of the same type) with nodes at the crossings, so that each bar element lies in exactly one host element. Without
 splitting, a stiff bond forces the host displacement along a bar element to follow the bar element's (linear)
@@ -110,7 +116,10 @@ class EmbeddedBondSchema:
     """The options this generator accepts, owned by this module and never mutated from outside it."""
 
     rebarElSet: str | None = schemaField(
-        description="The element set of the reinforcement bar (truss) elements.", dtype=str, default=None, required=True
+        description="The element set of the reinforcement bar (truss or beam) elements.",
+        dtype=str,
+        default=None,
+        required=True,
     )
     hostElSet: str | None = schemaField(
         description="The element set of the host continuum elements.", dtype=str, default=None, required=True

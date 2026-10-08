@@ -108,6 +108,10 @@ Relevant module ``edelweissfe.generators.embeddedbond``
     :language: edelweiss
     :caption: Example: ``testfiles/marmot/EmbeddedBondPullOut2D/test.inp``
 
+.. literalinclude:: ../../../testfiles/marmot/EmbeddedBeamPile2D/test.inp
+    :language: edelweiss
+    :caption: Example (embedded beam): ``testfiles/marmot/EmbeddedBeamPile2D/test.inp``
+
 ``cuboidlatticegenerator`` - A cuboid lattice mesh generator
 ------------------------------------------------------------
 
