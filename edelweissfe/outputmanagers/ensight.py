@@ -107,6 +107,12 @@ class EnsightConfigurationSchema:
         dtype=str,
         default=None,
     )
+    deformationScaleFactor: float = schemaField(
+        description="Used with deformedGeometry: the geometry is written as reference coordinates + this factor "
+        "times the field, e.g., 10 to magnify small deformations. The written field values are not scaled.",
+        dtype=float,
+        default=1.0,
+    )
 
 
 @dataclass(frozen=True)
@@ -219,14 +225,16 @@ class EnsightUnstructuredPart:
         self.nodeCoordinateArray = np.asarray([node.coordinates for node in nodes])
         self.referenceCoordinateArray = self.nodeCoordinateArray
 
-    def deform(self, nodeField) -> None:
-        """Set the coordinates to the reference coordinates plus the nodal values ``U`` of a vector node field;
-        nodes without the field keep their reference coordinates.
+    def deform(self, nodeField, scaleFactor: float = 1.0) -> None:
+        """Set the coordinates to the reference coordinates plus the (scaled) nodal values ``U`` of a vector node
+        field; nodes without the field keep their reference coordinates.
 
         Parameters
         ----------
         nodeField
             The :class:`~edelweissfe.fields.nodefield.NodeField`, e.g., of the displacement.
+        scaleFactor
+            The factor the nodal values are scaled with, e.g., to magnify small deformations.
         """
         if len(self.nodes) == 0:
             return
@@ -239,7 +247,7 @@ class EnsightUnstructuredPart:
         U = np.asarray(nodeField["U"])
         coordinates = np.array(self.referenceCoordinateArray, dtype=float, copy=True)
         nDim = min(coordinates.shape[1], U.shape[1])
-        coordinates[hasField, :nDim] += U[rows[hasField], :nDim]
+        coordinates[hasField, :nDim] += scaleFactor * U[rows[hasField], :nDim]
         self.nodeCoordinateArray = coordinates
 
     def writeToFile(
@@ -923,6 +931,7 @@ class OutputManager(OutputManagerBase):
         self.overwrite = defaults.overwrite
         transient = defaults.transient
         self.deformedGeometry = defaults.deformedGeometry
+        self.deformationScaleFactor = defaults.deformationScaleFactor
         configSetName = None
         configIsNodeSet = None
 
@@ -934,6 +943,7 @@ class OutputManager(OutputManagerBase):
             transient = configurationBlock.transient
             self.overwrite = configurationBlock.overwrite
             self.deformedGeometry = configurationBlock.deformedGeometry
+            self.deformationScaleFactor = configurationBlock.deformationScaleFactor
 
             if configurationBlock.nSet:
                 configSetName = configurationBlock.nSet
@@ -1196,7 +1206,7 @@ class OutputManager(OutputManagerBase):
             nodeField = model.nodeFields[self.deformedGeometry]
             for part in self.geometryParts:
                 if hasattr(part, "deform"):
-                    part.deform(nodeField)
+                    part.deform(nodeField, self.deformationScaleFactor)
             mesh_changed = True
 
         if mesh_changed:

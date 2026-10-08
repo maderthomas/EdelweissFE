@@ -453,7 +453,8 @@ perimeter=0.3545
         _run(tmp_path, shared, "RF")
 
 
-def test_ensight_deformed_geometry(tmp_path):
+@pytest.mark.parametrize("scale", [1.0, 10.0])
+def test_ensight_deformed_geometry(tmp_path, scale):
     """>>configuration, deformedGeometry=displacement writes the geometry in the deformed configuration: in the
     Ensight file, the concrete and the rebar coordinates move by their displacements"""
     vtkEnSight = pytest.importorskip("vtkmodules.vtkIOEnSight")
@@ -470,9 +471,9 @@ embeddedElSet=rebars, hostElSet=gen_all
             "*step,",
             """*output, type=ensight, name=esExport
 >>perNode, fieldOutput=uAll
->>configuration, overwrite=yes, deformedGeometry=displacement
+>>configuration, overwrite=yes, deformedGeometry=displacement, deformationScaleFactor={scale}
 
-*step,""",
+*step,""".format(scale=scale),
         ).replace("*fieldOutput\n", "*fieldOutput\n>>perNode, name=uAll, elSet=all, field=displacement, result=U\n")
     )
     import os
@@ -505,8 +506,8 @@ embeddedElSet=rebars, hostElSet=gen_all
         )
         if labels is not None:
             X0 = np.array([model.nodes[int(n)].coordinates for n in labels])
-            np.testing.assert_allclose(X - X0, U, atol=1e-6)
-        # the right edge moved by 0.004
-        assert X[:, 0].max() == pytest.approx(4.004, abs=1e-6)
+            np.testing.assert_allclose(X - X0, scale * U, atol=1e-6 * scale)
+        # the right edge moved by 0.004 (scaled)
+        assert X[:, 0].max() == pytest.approx(4.0 + scale * 0.004, abs=1e-6 * scale)
         return
     pytest.fail(f"no part with the displacement found in {names}")
