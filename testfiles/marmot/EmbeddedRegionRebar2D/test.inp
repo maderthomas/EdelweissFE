@@ -54,7 +54,7 @@ embeddedElSet=rebars, hostElSet=gen_all
 >>perElement, fieldOutput=rebarNormalForce
 >>perNode, fieldOutput=displacement
 >>perElement, fieldOutput=rebarStress
->>configuration, overwrite=yes
+>>configuration, overwrite=yes, deformedGeometry=displacement
 
 *step, solver=theSolver
 maxInc=1.0, minInc=1e-8, maxNumInc=10, maxIter=10, stepLength=1

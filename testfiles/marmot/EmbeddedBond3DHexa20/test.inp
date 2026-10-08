@@ -63,7 +63,7 @@ splitBars=True
 >>perElement, fieldOutput=rebarNormalForce
 >>perNode, fieldOutput=displacement
 >>perElement, fieldOutput=slip
->>configuration, overwrite=yes
+>>configuration, overwrite=yes, deformedGeometry=displacement
 
 *step, solver=theSolver
 maxInc=0.25, minInc=1e-8, maxNumInc=100, maxIter=15, stepLength=1

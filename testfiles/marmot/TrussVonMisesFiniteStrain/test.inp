@@ -47,7 +47,7 @@ tie
 *output, type=ensight, name=esExport
 >>perNode, fieldOutput=displacement
 >>perElement, fieldOutput=normalForce
->>configuration, overwrite=yes
+>>configuration, overwrite=yes, deformedGeometry=displacement
 
 *step, solver=theSolver
 maxInc=0.05, minInc=1e-8, maxNumInc=1000, maxIter=15, stepLength=1

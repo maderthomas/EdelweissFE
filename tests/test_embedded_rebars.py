@@ -451,3 +451,62 @@ perimeter=0.3545
 """ + _UNIAXIAL_STEP.replace(">>perNode, name=RFrebar", "**").replace(">>perElement, name=rebarStrain", "**")
     with pytest.raises(ValueError, match="shares node"):
         _run(tmp_path, shared, "RF")
+
+
+def test_ensight_deformed_geometry(tmp_path):
+    """>>configuration, deformedGeometry=displacement writes the geometry in the deformed configuration: in the
+    Ensight file, the concrete and the rebar coordinates move by their displacements"""
+    vtkEnSight = pytest.importorskip("vtkmodules.vtkIOEnSight")
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+
+    deck = (
+        _concreteStrip()
+        + _rebarsInStrip()
+        + """
+*constraint, type=embeddedRegion, name=embedded
+embeddedElSet=rebars, hostElSet=gen_all
+"""
+        + _UNIAXIAL_STEP.replace(
+            "*step,",
+            """*output, type=ensight, name=esExport
+>>perNode, fieldOutput=uAll
+>>configuration, overwrite=yes, deformedGeometry=displacement
+
+*step,""",
+        ).replace("*fieldOutput\n", "*fieldOutput\n>>perNode, name=uAll, elSet=all, field=displacement, result=U\n")
+    )
+    import os
+
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        model, _ = _run(tmp_path, deck, "RF")
+    finally:
+        os.chdir(cwd)
+
+    reader = vtkEnSight.vtkGenericEnSightReader()
+    reader.SetCaseFileName(str(tmp_path / "esExport.case"))
+    reader.UpdateInformation()
+    times = reader.GetTimeSets().GetItem(0)
+    reader.SetTimeValue(times.GetValue(times.GetNumberOfTuples() - 1))
+    reader.Update()
+    blocks = reader.GetOutput()
+    names = [reader.GetDescription(i) for i in range(reader.GetNumberOfOutputPorts())]
+    for i in range(blocks.GetNumberOfBlocks()):
+        block = blocks.GetBlock(i)
+        if block is None or block.GetPointData().GetArray("uAll") is None:
+            continue
+        X = vtk_to_numpy(block.GetPoints().GetData())[:, :2]
+        U = vtk_to_numpy(block.GetPointData().GetArray("uAll"))[:, :2]
+        labels = (
+            vtk_to_numpy(block.GetPointData().GetArray("Node Ids"))
+            if block.GetPointData().GetArray("Node Ids")
+            else None
+        )
+        if labels is not None:
+            X0 = np.array([model.nodes[int(n)].coordinates for n in labels])
+            np.testing.assert_allclose(X - X0, U, atol=1e-6)
+        # the right edge moved by 0.004
+        assert X[:, 0].max() == pytest.approx(4.004, abs=1e-6)
+        return
+    pytest.fail(f"no part with the displacement found in {names}")

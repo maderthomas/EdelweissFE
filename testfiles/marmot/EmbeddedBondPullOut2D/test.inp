@@ -73,7 +73,7 @@ splitBars=True
 >>perNode, fieldOutput=displacement
 >>perElement, fieldOutput=slip
 >>perElement, fieldOutput=bondStress
->>configuration, overwrite=yes
+>>configuration, overwrite=yes, deformedGeometry=displacement
 
 *step, solver=theSolver
 maxInc=0.05, minInc=1e-8, maxNumInc=1000, maxIter=15, stepLength=1
