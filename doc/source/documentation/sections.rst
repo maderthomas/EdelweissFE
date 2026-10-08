@@ -6,6 +6,15 @@ Relevant module: ``edelweissfe.config.sections``
 .. automodule:: edelweissfe.config.sections
    :members: __doc__
 
+``beam`` - Beam elements
+------------------------
+
+.. automodule:: edelweissfe.sections.beam
+   :members: __doc__
+
+.. pprint:: section:beam
+   :caption: Options:
+
 ``truss`` - Truss (bar) elements
 --------------------------------
 
