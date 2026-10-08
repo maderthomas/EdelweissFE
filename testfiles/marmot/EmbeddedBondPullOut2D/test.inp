@@ -64,8 +64,12 @@ splitBars=True
 >>perNode, name=F, nSet=loadedEnd, field=displacement, result=P, f(x)='sum(x[:,0])', saveHistory=True,
 >>perElement, name=slip, elSet=rebarBond_bond, result=slip, quadraturePoint=0,
 >>perElement, name=bondStress, elSet=rebarBond_bond, result=bond stress, quadraturePoint=0,
+>>perNode, name=rebarDisplacement, elSet=rebars, field=displacement, result=U
+>>perElement, name=rebarNormalForce, elSet=rebars, result=normal force, quadraturePoint=0,
 
 *output, type=ensight, name=esExport
+>>perNode, fieldOutput=rebarDisplacement
+>>perElement, fieldOutput=rebarNormalForce
 >>perNode, fieldOutput=displacement
 >>perElement, fieldOutput=slip
 >>perElement, fieldOutput=bondStress

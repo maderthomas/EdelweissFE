@@ -55,8 +55,12 @@ splitBars=True
 *fieldOutput
 >>perNode, name=displacement, elSet=gen_all, field=displacement, result=U
 >>perElement, name=slip, elSet=rebarBond_bond, result=slip, quadraturePoint=0,
+>>perNode, name=rebarDisplacement, elSet=rebars, field=displacement, result=U
+>>perElement, name=rebarNormalForce, elSet=rebars, result=normal force, quadraturePoint=0,
 
 *output, type=ensight, name=esExport
+>>perNode, fieldOutput=rebarDisplacement
+>>perElement, fieldOutput=rebarNormalForce
 >>perNode, fieldOutput=displacement
 >>perElement, fieldOutput=slip
 >>configuration, overwrite=yes

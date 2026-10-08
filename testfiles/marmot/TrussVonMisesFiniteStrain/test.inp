@@ -39,8 +39,15 @@ tie
 *solver, solver=NIST, name=theSolver
 
 *fieldOutput
+>>perNode, name=displacement, elSet=all, field=displacement, result=U
+>>perElement, name=normalForce, elSet=all, result=normal force, quadraturePoint=0,
 >>perNode, name=F, nSet=apex, field=displacement, result=P, f(x)='sum(x[:,1])', saveHistory=True,
 >>perElement, name=N, elSet=bars, result=normal force, quadraturePoint=0, saveHistory=True,
+
+*output, type=ensight, name=esExport
+>>perNode, fieldOutput=displacement
+>>perElement, fieldOutput=normalForce
+>>configuration, overwrite=yes
 
 *step, solver=theSolver
 maxInc=0.05, minInc=1e-8, maxNumInc=1000, maxIter=15, stepLength=1
