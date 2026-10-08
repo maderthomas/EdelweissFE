@@ -47,6 +47,12 @@ The generator needs the bar and host elements, so it must run after the manual m
 (``executeAfterManualGeneration=True``). It creates the element set ``<name>_bond`` and a section assigning the
 bond-slip law and the bond element properties (perimeter, part of the bar element, integration points).
 
+With ``largeSlip=True`` (and ``maxSlip``), Marmot ``EmbeddedLargeSlipBondElement`` elements are created instead: the bond
+is integrated over the channel (the original bar path in each host element, carrying the bond history), and the
+bar partner of every channel point is searched among the bar elements within ``maxSlip`` of the channel. The bars
+may then slide far: the part of a bar pulled out of the host is unbonded and the bonded length shrinks. The bar
+elements are chained into polylines for this, so they must form unbranched chains.
+
 For perfect bond, use the ``embeddedRegion`` constraint (:mod:`edelweissfe.constraints.embeddedregion`) instead, or a
 stiff ``LINEARELASTICBONDSLIP`` law.
 
@@ -82,6 +88,9 @@ from edelweissfe.utils.embedding import (
     splitBarElementAtHostBoundaries,
 )
 from edelweissfe.utils.schema import schemaField
+
+#: The largest window of bar elements of the registered Marmot large-slip bond elements.
+MAX_LARGE_SLIP_WINDOW = 48
 
 #: The abbreviation of a host element shape in the Marmot bond element names.
 HOST_SHAPE_CODES = {"quad4": "Q4", "quad8": "Q8", "tetra4": "T4", "hexa8": "H8", "hexa20": "H20"}
@@ -127,6 +136,18 @@ class EmbeddedBondSchema:
         description="Tolerance of the parametric coordinates on the boundary of a host element.",
         dtype=float,
         default=1e-10,
+    )
+    largeSlip: bool = schemaField(
+        description="Large slip: the bars may slide out of (or into) their hosts, see the module documentation. "
+        "Requires maxSlip.",
+        dtype=bool,
+        default=False,
+    )
+    maxSlip: float | None = schemaField(
+        description="Large slip only: the largest slip expected, which sets the window of bar elements each bond "
+        "element couples to; a larger slip stops the analysis with an error.",
+        dtype=float,
+        default=None,
     )
     splitBars: bool = schemaField(
         description="Replace the bar elements by bar elements with nodes at the crossings of the host element "
@@ -199,33 +220,88 @@ class Generator(GeneratorBase):
         bondElements = []
         properties = {}
         bondedLength, unbondedLength = 0.0, 0.0
-        for bar in rebarElements:
-            barShape, barCoordinates = barGeometry(bar)
-            parts, _ = splitBarElementAtHostBoundaries(bar, locator)
-            length = barLength(barShape, barCoordinates)
-            partsLength = sum(barLength(barShape, barCoordinates, p.etaStart, p.etaEnd) for p in parts)
-            bondedLength += partsLength
-            unbondedLength += length - partsLength
 
-            for part in parts:
-                shared = set(bar.nodes) & set(part.hostElement.nodes)
-                if shared:
-                    raise ValueError(
-                        f"{name}: bar element {bar.elNumber} shares node(s) {sorted(n.label for n in shared)} with "
-                        f"host element {part.hostElement.elNumber}; bond-slip needs bar nodes independent of the "
-                        "host (use the embeddedRegion constraint for perfect bond of a conforming bar mesh)."
+        def createBondElement(elType, nodes, props):
+            (label,) = model.topology.reserveElementNumbers(1)
+            bondElement = getElementClass(elType, "marmot")(elType, label)
+            bondElement.setNodes(nodes)
+            model.createElement(bondElement)
+            bondElements.append(bondElement)
+            if configuration.nIntegrationPoints:
+                props = props + [float(configuration.nIntegrationPoints)]
+            properties[label] = np.array(props, dtype=float)
+
+        def checkIndependent(barNodes, host):
+            shared = set(barNodes) & set(host.nodes)
+            if shared:
+                raise ValueError(
+                    f"{name}: bar node(s) {sorted(n.label for n in shared)} are nodes of host element "
+                    f"{host.elNumber}; bond-slip needs bar nodes independent of the host (use the embeddedRegion "
+                    "constraint for perfect bond of a conforming bar mesh)."
+                )
+
+        if configuration.largeSlip:
+            if not configuration.maxSlip or configuration.maxSlip <= 0:
+                raise ValueError(f"{name}: largeSlip requires a positive maxSlip.")
+            for chain in _chainBars(rebarElements):
+                barShape = chain.shape
+                for k, (bar, reversed_) in enumerate(chain.elements):
+                    barShapeK, barCoordinates = barGeometry(bar)
+                    parts, _ = splitBarElementAtHostBoundaries(bar, locator)
+                    length = barLength(barShapeK, barCoordinates)
+                    partsLength = sum(barLength(barShapeK, barCoordinates, p.etaStart, p.etaEnd) for p in parts)
+                    bondedLength += partsLength
+                    unbondedLength += length - partsLength
+                    for part in parts:
+                        # the channel in the chain parameter, c = k + (xi + 1) / 2 with xi along the chain
+                        xis = sorted((-part.etaEnd, -part.etaStart) if reversed_ else (part.etaStart, part.etaEnd))
+                        cStart, cEnd = (k + 0.5 * (xi + 1) for xi in xis)
+                        SStart = chain.S[k] + (cStart - k) * chain.lengths[k]
+                        SEnd = chain.S[k] + (cEnd - k) * chain.lengths[k]
+                        k0 = max(i for i in range(k + 1) if chain.S[i] <= SStart - configuration.maxSlip or i == 0)
+                        k1 = min(
+                            i
+                            for i in range(k, len(chain.elements))
+                            if chain.S[i + 1] >= SEnd + configuration.maxSlip or i == len(chain.elements) - 1
+                        )
+                        window = k1 - k0 + 1
+                        if window > MAX_LARGE_SLIP_WINDOW:
+                            raise ValueError(
+                                f"{name}: maxSlip={configuration.maxSlip} needs a window of {window} bar elements, at "
+                                f"most {MAX_LARGE_SLIP_WINDOW} are supported; refine less or reduce maxSlip."
+                            )
+                        windowNodes = chain.windowNodes(k0, k1)
+                        checkIndependent(windowNodes, part.hostElement)
+                        elType = (
+                            "EBLS" + bondElementType(nDim, barShape, part.hostElement.ensightType)[2:] + f"W{window}"
+                        )
+                        createBondElement(
+                            elType,
+                            list(part.hostElement.nodes) + windowNodes,
+                            [
+                                configuration.perimeter,
+                                cStart - k0,
+                                cEnd - k0,
+                                float(k0 == 0),
+                                float(k1 == len(chain.elements) - 1),
+                            ],
+                        )
+        else:
+            for bar in rebarElements:
+                barShape, barCoordinates = barGeometry(bar)
+                parts, _ = splitBarElementAtHostBoundaries(bar, locator)
+                length = barLength(barShape, barCoordinates)
+                partsLength = sum(barLength(barShape, barCoordinates, p.etaStart, p.etaEnd) for p in parts)
+                bondedLength += partsLength
+                unbondedLength += length - partsLength
+
+                for part in parts:
+                    checkIndependent(bar.nodes, part.hostElement)
+                    createBondElement(
+                        bondElementType(nDim, barShape, part.hostElement.ensightType),
+                        list(bar.nodes) + list(part.hostElement.nodes),
+                        [configuration.perimeter, part.etaStart, part.etaEnd],
                     )
-                elType = bondElementType(nDim, barShape, part.hostElement.ensightType)
-                (label,) = model.topology.reserveElementNumbers(1)
-                bondElement = getElementClass(elType, "marmot")(elType, label)
-                bondElement.setNodes(list(bar.nodes) + list(part.hostElement.nodes))
-                model.createElement(bondElement)
-                bondElements.append(bondElement)
-
-                props = [configuration.perimeter, part.etaStart, part.etaEnd]
-                if configuration.nIntegrationPoints:
-                    props.append(float(configuration.nIntegrationPoints))
-                properties[label] = np.array(props, dtype=float)
 
         elementSet = ElementSet(f"{name}_bond", bondElements)
         model.elementSets[elementSet.name] = elementSet
@@ -298,3 +374,62 @@ def _splitBarAtHostBoundaries(bar, locator: HostElementLocator, model: FEModel) 
                     nodeSet.replaceMembers([n for n in nodeSet if n is not midNode])
 
     return newBars
+
+
+class _BarChain:
+    """An unbranched chain of bar elements, ordered along the chain, with their orientation."""
+
+    def __init__(self, elements: list):
+        #: (bar element, reversed w.r.t. the chain direction)
+        self.elements = elements
+        self.shape = elements[0][0].ensightType
+        self.lengths = []
+        for bar, _ in elements:
+            shape, coordinates = barGeometry(bar)
+            if shape != self.shape:
+                raise ValueError("A chain of bars must not mix linear and quadratic bar elements.")
+            self.lengths.append(barLength(shape, coordinates))
+        #: reference arc length at the start of each element, and at the chain end
+        self.S = np.concatenate([[0.0], np.cumsum(self.lengths)])
+
+    def windowNodes(self, k0: int, k1: int) -> list:
+        """The unique nodes of the elements k0..k1 in chain order (bar2: e0 e1 ...; bar3: e0 m0 e1 m1 ...)."""
+        nodes = []
+        for bar, reversed_ in self.elements[k0 : k1 + 1]:
+            start, end = (bar.nodes[1], bar.nodes[0]) if reversed_ else (bar.nodes[0], bar.nodes[1])
+            if not nodes:
+                nodes.append(start)
+            if self.shape == "bar3":
+                nodes.append(bar.nodes[2])
+            nodes.append(end)
+        return nodes
+
+
+def _chainBars(bars: list) -> list:
+    """Order bar elements into unbranched chains connected by their end nodes."""
+    elementsAtNode = {}
+    for bar in bars:
+        for node in bar.nodes[:2]:
+            elementsAtNode.setdefault(node, []).append(bar)
+    for node, elements in elementsAtNode.items():
+        if len(elements) > 2:
+            raise ValueError(f"Large slip needs unbranched bars, but node {node.label} joins {len(elements)} bars.")
+
+    remaining = {id(b): b for b in bars}
+    chains = []
+    while remaining:
+        # start at a free end, if there is one
+        start = next(
+            (b for b in remaining.values() if any(len(elementsAtNode[n]) == 1 for n in b.nodes[:2])),
+            next(iter(remaining.values())),
+        )
+        startNode = start.nodes[0] if len(elementsAtNode[start.nodes[0]]) == 1 else start.nodes[1]
+        chain, bar, node = [], start, startNode
+        while bar is not None and id(bar) in remaining:
+            del remaining[id(bar)]
+            reversed_ = bar.nodes[0] is not node
+            chain.append((bar, reversed_))
+            node = bar.nodes[0] if reversed_ else bar.nodes[1]
+            bar = next((b for b in elementsAtNode[node] if b is not bar and id(b) in remaining), None)
+        chains.append(_BarChain(chain))
+    return chains

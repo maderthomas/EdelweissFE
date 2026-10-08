@@ -449,7 +449,7 @@ hostElSet=gen_all
 material=bond
 perimeter=0.3545
 """ + _UNIAXIAL_STEP.replace(">>perNode, name=RFrebar", "**").replace(">>perElement, name=rebarStrain", "**")
-    with pytest.raises(ValueError, match="shares node"):
+    with pytest.raises(ValueError, match="are nodes of host element"):
         _run(tmp_path, shared, "RF")
 
 
@@ -511,3 +511,76 @@ embeddedElSet=rebars, hostElSet=gen_all
         assert X[:, 0].max() == pytest.approx(4.0 + scale * 0.004, abs=1e-6 * scale)
         return
     pytest.fail(f"no part with the displacement found in {names}")
+
+
+def _largeSlipPullOutDeck(bondMaterial: str, generatorOptions: str, pull: float, maxInc: float = 0.05):
+    """a rigid bar along y = 0.37 from x = 0 to 9 (18 elements), bonded in the strip x = 0..4 (rigid host)"""
+    bar, first, last = _bar(100001, (0.0, 0.37), (9.0, 0.37), 18)
+    return _concreteStrip(nX=5) + f"""{bar}
+*elSet, elSet=rebars, generate=True
+{first}, {last - 1}, 1
+
+*nSet, nSet=barNodes, generate=True
+{first}, {last}, 1
+
+*nSet, nSet=loadedEnd
+{last}
+
+*section, name=rebarSection, area=100.0, material=steel, type=truss
+rebars
+
+{bondMaterial}
+
+*modelGenerator, generator=embeddedBond, name=rebarBond, executeAfterManualGeneration=True
+rebarElSet=rebars
+hostElSet=gen_all
+material=bond
+perimeter={PERIMETER}
+{generatorOptions}
+
+*job, name=job, domain=2d
+*solver, solver=NIST, name=theSolver
+
+*fieldOutput
+>>perNode, name=F, nSet=loadedEnd, field=displacement, result=P, f(x)='sum(x[:,0])', saveHistory=True,
+>>perNode, name=s, nSet=loadedEnd, field=displacement, result=U, f(x)='sum(x[:,0])', saveHistory=True,
+
+*step, solver=theSolver
+maxInc={maxInc}, minInc=1e-8, maxNumInc=10000, maxIter=15, stepLength=1
+>>dirichlet, name=host, nSet=gen_all, field=displacement, 1=0, 2=0
+>>dirichlet, name=barY, nSet=barNodes, field=displacement, 2=0
+>>dirichlet, name=pull, nSet=loadedEnd, field=displacement, 1={pull}
+"""
+
+
+def test_large_slip_equals_small_slip_for_small_slip(tmp_path):
+    """for slips small compared to the bonded length, the large-slip bond gives the small-slip response"""
+    law = (
+        "*material, name=ModelCode2010BondSlip, id=bond, provider=marmot\n13.69, 1.0, 2.0, 10.0, 0.4, 5.48, 200.0, 1e4"
+    )
+    _, (FSmall,) = _run(tmp_path, _largeSlipPullOutDeck(law, "", 0.02, 0.25), "F")
+    _, (FLarge,) = _run(tmp_path, _largeSlipPullOutDeck(law, "largeSlip=True\nmaxSlip=1.0", 0.02, 0.25), "F")
+    np.testing.assert_allclose(
+        np.asarray(FLarge.getResultHistory()), np.asarray(FSmall.getResultHistory()), rtol=2e-2, atol=1e-9
+    )
+
+
+def test_large_slip_complete_pull_out(tmp_path):
+    """a rigid bar pulled completely out of a rigid host with a linear bond law: the bonded length shrinks as
+    L_b - s, so F = K_t s p (L_b - s), and the force vanishes once the bar has left the host"""
+    Kt, Lb = 10.0, 4.0
+    deck = _largeSlipPullOutDeck(
+        f"*material, name=LinearElasticBondSlip, id=bond, provider=marmot\n{Kt}, 1e4",
+        "largeSlip=True\nmaxSlip=6.0\nnIntegrationPoints=3",
+        6.0,
+    )
+    model, (F, s) = _run(tmp_path, deck, "F", "s")
+    assert any(el.elType.startswith("EBLS") for el in model.elementSets["rebarBond_bond"])
+    slip, force = np.asarray(s.getResultHistory()).ravel(), np.asarray(F.getResultHistory()).ravel()
+    for target in (0.5, 1.0, 2.0, 3.0):
+        i = np.argmin(np.abs(slip - target))
+        expected = Kt * slip[i] * PERIMETER * (Lb - slip[i])
+        # the bond fades smoothly over the tributary parts at the bar end: a small deviation from the exact length
+        np.testing.assert_allclose(force[i], expected, rtol=3e-2, err_msg=f"at s = {slip[i]}")
+    assert np.all(np.abs(force[slip > Lb + 0.1]) < 1e-6)  # Newton tolerance
+    assert force.max() == pytest.approx(Kt * PERIMETER * Lb**2 / 4, rel=3e-2)
