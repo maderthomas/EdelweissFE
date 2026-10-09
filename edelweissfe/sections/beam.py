@@ -27,6 +27,7 @@
 #  ---------------------------------------------------------------------
 """
 A section for beam elements, e.g., the Marmot Euler-Bernoulli beams ``BE2D2``, ``BE2D3``, ``BE3D2``, ``BE3D3``,
+``BE2D2CR`` (co-rotational),
 which integrate their cross section over section points with one material instance per point (any Marmot
 hypoelastic material). This section generates the points (see :mod:`edelweissfe.utils.beamsections`) and passes
 them, with the orientation and the torsion constant, as element properties.
@@ -51,6 +52,11 @@ beam). The local y axis lies in the plane of a 2D beam; in 3D it is the part of 
 n1z)`` normal to the beam axis, and :math:`z = x \\times y`. Without an orientation vector, :math:`(0, 0, 1)` is
 used, or :math:`(0, 1, 0)` for beams (almost) parallel to the global z axis. In 2D, the z coordinates of the points
 are dropped (use ``nZ=1`` for rectangles).
+
+``multiplicity=k`` makes the beam stand for k identical parallel members (the point areas, A, I and J are scaled by
+k, the coordinates are not), e.g., k fibres stacked through the thickness of a 2D model, as the area of a truss.
+
+The co-rotational (finite rotation) variant ``BE2D2CR`` takes the same section.
 
 One material per element: a composite section (e.g., steel and concrete) is modeled by several beam elements on
 the same nodes, one per material, each with its part of the section (the fiber integration is additive).
@@ -128,6 +134,12 @@ class BeamSectionSchema:
     J: float | None = schemaField(
         description="3D: torsion constant (overrides the computed one)", dtype=float, default=None
     )
+    multiplicity: float = schemaField(
+        description="The number of identical parallel members this beam stands for (scales the point areas, and thus "
+        "A, I and J, but not the coordinates; e.g., k fibres stacked through the thickness of a 2D model).",
+        dtype=float,
+        default=1.0,
+    )
     centroidAtAxis: bool = schemaField(
         description="Shift the section points such that their centroid lies on the beam axis.", dtype=bool, default=True
     )
@@ -195,6 +207,11 @@ def sectionPoints(c: BeamSectionSchema, nDim: int) -> tuple[beamsections.Section
         points = points.centered()
     if c.J is not None:
         J = c.J
+    if c.multiplicity != 1.0:
+        if c.multiplicity <= 0:
+            raise ValueError("The multiplicity of a beam section must be positive.")
+        points = beamsections.SectionPoints.fromArrays(points.y, points.z, points.area * c.multiplicity)
+        J = J * c.multiplicity if J is not None else None
     return points, J
 
 
