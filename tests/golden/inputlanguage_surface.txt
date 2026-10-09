@@ -167,6 +167,8 @@ Define a field using a scalar expression.
     [component] The component of the field. (<class 'int'>)
     [penalty] The numerical penalty value. (<class 'float'>)
     [nSet] The node set to be constrained. (<class 'str'>)
+  optional arguments
+    [tangentOnly] Add the spring stiffness to the tangent only, without a force: a numerical stabilization that damps the Newton corrections of (nearly) force-free dofs, e.g., the transverse dofs of truss pieces held by nothing else, without changing the solution. (<class 'bool'>, default = False)
 ===== module documentation: edelweissfe.constraints.equalvaluelagrangian =====
 [equalvaluelagrangian] A lagrangian multiplier based constraint used for constraining nodal values of a node set to be equal.
   required arguments

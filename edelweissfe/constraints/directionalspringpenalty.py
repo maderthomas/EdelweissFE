@@ -44,6 +44,10 @@ from edelweissfe.utils.schema import buildSchemaFromOptions, schemaField
 
 """
 A penalty based constraint used for assigning a specific stiffness to the nodes of a defined node set.
+
+With ``tangentOnly=True``, the stiffness enters only the tangent (no force): a numerical stabilization of dofs without
+stiffness of their own (e.g., the transverse dofs of a truss piece pulled out of its host), which damps their Newton
+corrections and leaves the solution unchanged.
 """
 
 
@@ -68,6 +72,13 @@ class DirectionalSpringPenaltySchema:
     )
     nSet: str | None = schemaField(
         description="The node set to be constrained.", dtype=str, default=None, required=True
+    )
+    tangentOnly: bool = schemaField(
+        description="Add the spring stiffness to the tangent only, without a force: a numerical stabilization that "
+        "damps the Newton corrections of (nearly) force-free dofs, e.g., the transverse dofs of truss pieces held by "
+        "nothing else, without changing the solution.",
+        dtype=bool,
+        default=False,
     )
 
 
@@ -108,6 +119,7 @@ class Constraint(ConstraintBase, MeshDependent):
         self.sizeField = getFieldSize(self.theField, model.domainSize)
         self.component = configuration.component
         self.penalty = configuration.penalty
+        self.tangentOnly = configuration.tangentOnly
         self._nodes = nSet
 
         self.active = True
@@ -176,9 +188,9 @@ class Constraint(ConstraintBase, MeshDependent):
         if not self.active:
             return
 
-        values = U_np[self.indices_component]
-
-        PExt[self.indices_component] -= self.penalty * values
+        if not self.tangentOnly:
+            values = U_np[self.indices_component]
+            PExt[self.indices_component] -= self.penalty * values
 
         diag = np.diag(K)
         diag.setflags(write=True)  # bug in numpy
