@@ -272,6 +272,9 @@ class NISTPArcLength(NISTParallel):
         R_f = R_[:, 1]
         F = self.theDofManager.constructDofVector()  # accumulated Flux vector
         FConstraints = self.theDofManager.constructDofVector()  # accumulated constraint Flux vector
+        # constraint contributions (penalty forces, Lagrange terms) follow the NIST convention R = PExt - P,
+        # i.e. they are external forces; assembling them into P would flip their sign (penalty -> negative spring)
+        PConstraints = self.theDofManager.constructDofVector()
 
         P_0 = self.theDofManager.constructDofVector()
         P_f = self.theDofManager.constructDofVector()
@@ -300,10 +303,12 @@ class NISTPArcLength(NISTParallel):
             U_np[:] = U_n
             U_np += dU
 
-            P[:] = K[:] = F[:] = FConstraints[:] = P_0[:] = P_f[:] = K_f[:] = K_0[:] = 0.0
+            P[:] = K[:] = F[:] = FConstraints[:] = PConstraints[:] = P_0[:] = P_f[:] = K_f[:] = K_0[:] = 0.0
 
             P, K, F = self.computeElements(model.elements, U_np, dU, P, K, F, timeStep)
-            P, K = self.assembleConstraints(model.constraints, U_np, dU, P, K, timeStep, FConstraints)
+            PConstraints, K = self.assembleConstraints(
+                model.constraints, U_np, dU, PConstraints, K, timeStep, FConstraints
+            )
 
             P_0, K_0 = self.assembleLoads(
                 nodeForces, distributedLoads, bodyForces, U_np, P_0, K_0, zeroTimeStep
@@ -322,7 +327,7 @@ class NISTPArcLength(NISTParallel):
             K_f -= K_0
 
             # Dead and Reference load ..
-            R_0[:] = P_0 + (Lambda + dLambda) * P_f - P
+            R_0[:] = P_0 + (Lambda + dLambda) * P_f - P + PConstraints
             R_f[:] = P_f
 
             # add stiffness contribution
