@@ -69,6 +69,22 @@ def test_inverse_mapping(shape):
         np.testing.assert_allclose(inverseMapping(shape, coords, x), xi, atol=1e-10)
 
 
+@pytest.mark.parametrize("shape", ["quad4", "quad8", "hexa8", "hexa20"])
+@pytest.mark.parametrize("offset", [4.5e3, 1e5])
+def test_inverse_mapping_far_from_the_origin(shape, offset):
+    """Elements of a few mm far from the origin (e.g. a tunnel segment at R ~ 4.5 m): the absolute round-off of the
+    coordinates must not prevent convergence."""
+    coords = 2.0 * _distorted(shape) + offset
+    rng = np.random.default_rng(2)
+    dim = coords.shape[1]
+    for _ in range(10):
+        xi = rng.uniform(-0.9, 0.9, dim)
+        x = shapeFunctionsAndDerivatives(shape, xi)[0] @ coords
+        result = inverseMapping(shape, coords, x)
+        assert result is not None
+        np.testing.assert_allclose(result, xi, atol=1e-9)
+
+
 def _node(label, x):
     return SimpleNamespace(label=label, coordinates=np.asarray(x, dtype=float))
 

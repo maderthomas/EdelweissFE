@@ -204,16 +204,21 @@ def inverseMapping(shape: str, nodeCoordinates: np.ndarray, x: np.ndarray, maxIt
     """
     xi = parentDomainCenter(shape)
     scale = np.max(np.ptp(nodeCoordinates, axis=0))
+    # Coordinates relative to the element's centroid: with absolute coordinates far from the origin (e.g. ~5e3 mm)
+    # the round-off of N @ X is larger than any absolute tolerance on dXi, and the iteration never converges.
+    x0 = nodeCoordinates.mean(axis=0)
+    X = nodeCoordinates - x0
+    xRel = np.asarray(x) - x0
     for _ in range(maxIterations):
         N, dN = shapeFunctionsAndDerivatives(shape, xi)
-        residual = N @ nodeCoordinates - x
-        J = nodeCoordinates.T @ dN
+        residual = N @ X - xRel
+        J = X.T @ dN
         try:
             dXi = -np.linalg.solve(J, residual)
         except np.linalg.LinAlgError:
             return None
         xi = xi + dXi
-        if np.linalg.norm(dXi) < 1e-13 and np.linalg.norm(residual) < 1e-10 * scale:
+        if np.linalg.norm(dXi) < 1e-11 and np.linalg.norm(residual) < 1e-10 * scale:
             return xi
         if np.max(np.abs(xi)) > 1e3:
             return None
