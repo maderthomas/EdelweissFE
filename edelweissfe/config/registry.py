@@ -195,6 +195,7 @@ _addBuiltins(
         "nodetorigidsurfacepenalty",
         "penaltyindirectcontrol",
         "rigidbody",
+        "rigidbodympc",
         "surfacetodeformablesurfacepenalty",
         "surfacetodiscreterigidbodypenalty",
         "tie",

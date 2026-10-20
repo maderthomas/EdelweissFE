@@ -60,6 +60,22 @@ Module ``edelweissfe.constraints.linearizedrigidbody``
     :caption: Example 3D: ``testfiles/marmot/LinearizedRigidBodyConstraint3D/test.inp``
 
 
+``rigidbodympc`` - Linearized rigid body by DOF elimination
+-----------------------------------------------------------
+
+Module ``edelweissfe.constraints.rigidbodympc``
+
+.. automodule:: edelweissfe.constraints.rigidbodympc
+    :members: __doc__
+
+.. pprint:: constraint:rigidbodympc
+    :caption: Options:
+
+.. literalinclude:: ../../../testfiles/marmot/RigidBodyMPC3D/test.inp
+    :language: edelweiss
+    :caption: Example 3D: ``testfiles/marmot/RigidBodyMPC3D/test.inp``
+
+
 ``rigidbody`` - Geometrically exact rigid body constraints in 3D
 ---------------------------------------------------------------------------
 
