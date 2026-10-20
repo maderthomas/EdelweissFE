@@ -41,7 +41,7 @@ initial OpenMP thread confines all of them to a single core.
 | `model.inp` | the shared model: units, geometry, material, sections, field outputs (included by every variant) |
 | `mesh.inp` | 20-node hexahedral mesh: GC3D20R concrete (displacement + nonlocal damage), C3D20R steel |
 | `mesh_hex8.inp`, `hex8_to_hex20.py` | the linear source mesh and the script that generated `mesh.inp` from it |
-| `blockamg.json` | every blockamg setting, defaults included (see below) |
+| `blockamg.json` | blockamg's log verbosity; every other setting is the default (see below) |
 
 To regenerate the mesh: `python hex8_to_hex20.py mesh_hex8.inp mesh.inp`.
 
@@ -61,17 +61,19 @@ The load peaks at about 0.1 mm; the panel then softens as a crack grows from the
 
 ## Expected results
 
-Measured on an AMD Ryzen Threadripper PRO 5995WX, 32 threads, one run at a time (EdelweissFE
-`next_v26.11`, September 2026):
+Every variant gives the same load-displacement curve up to the AMR one:
 
-| Variant | Run time | Linear solves | Time per solve | Peak load | Load at 1 mm |
-|---|---|---|---|---|---|
-| pardiso | 2174 s | 537 | 3.89 s | 3072 N at 0.110 mm | 132 N |
-| blockamg | 2020 s | 538 | 3.59 s | 3072 N at 0.110 mm | 132 N |
-| blockamg + AMR | 6027 s | 1091 | 4.47 s | 2773 N at 0.095 mm | 108 N |
+| Variant | Peak load | Load at 1 mm |
+|---|---|---|
+| pardiso | 3072 N at 0.110 mm | 132 N |
+| blockamg (defaults) | 3072 N at 0.110 mm | 132 N |
+| blockamg, former settings (for comparison) | 3072 N at 0.110 mm | 132 N |
+| blockamg + AMR (former settings) | 2773 N at 0.095 mm | 108 N |
 
-Variant 3 refines 21 times; the model grows from 218,564 to 286,856 degrees of freedom. At this
-model size a direct solver is still competitive: blockamg's advantage grows with the problem size.
+With its defaults, blockamg takes more linear solves than PARDISO -- its looser tolerance costs a few Newton
+iterations, and a fraction of the solves stop at the 100-iteration cap and rebuild their hierarchies -- but each
+solve is much cheaper, and the current defaults were measured faster end to end than both PARDISO and blockamg's
+former settings. Variant 3 refines repeatedly along the crack band, and the model grows by roughly a third.
 
 ## Viewing the results
 
@@ -95,39 +97,23 @@ mesh = reader.read()
 
 ## The blockamg settings
 
-`blockamg.json` lists every setting blockamg accepts, defaults included, so that each one is visible.
-The values that differ from the defaults are marked **bold**.
+`blockamg.json` sets only `verbosity` to `info` (one log line per linear solve, with its outer iteration
+count): every other setting is blockamg's own default. The table lists the main settings with their
+defaults; `doc/source/documentation/blockamgtheory.rst` explains why the defaults are what they are.
 
-| Setting | Value | Meaning |
+| Setting | Default | Meaning |
 |---|---|---|
-| `outerSolver` | `amgcl_lgmres` | the outer Krylov solver: AMGCL's LGMRES (or `scipy` GMRES) |
-| `outerTol` | `adaptive` | the outer tolerance: Eisenstat-Walker forcing between `etaMin` and `etaMax`, or a fixed number |
-| `outerRestart` | **50** | outer Krylov restart length (default 100) |
-| `outerMaxiter` | **3** | outer restart cycles, so at most `outerRestart * outerMaxiter` iterations (default 8) |
-| `lgmresM`, `lgmresK` | 30, 3 | LGMRES inner subspace size and number of augmentation vectors |
-| `lgmresAlwaysReset` | true | discard LGMRES's recycled vectors before every solve |
-| `lgmresResetOnNewIncrement` | false | discard them only at a new increment |
-| `sweeps` | 1 | block Gauss-Seidel sweeps over the fields per preconditioner application |
-| `symmetric` | **false** | no reverse sweep after the forward one: same iteration count, ~30 % cheaper here (default true) |
-| `fieldPreconds` | `{}` | per-field AMGCL parameter trees overriding the built-in defaults |
-| `useRigidBodyNullspace` | true | give the displacement AMG the six rigid-body modes as near null-space |
-| `p1FieldNames` | `[]` | fields preconditioned by p-multigrid through their corner nodes (experimental) |
-| `hierarchyDropTol` | 0.0 | drop small entries before building each AMG hierarchy (0: keep all) |
-| `etaMin` | **1e-4** | lower bound of the adaptive tolerance: late Newton iterations need no more accuracy (default 1e-6) |
-| `etaMax` | 3e-4 | upper bound of the adaptive tolerance |
-| `ewGamma`, `ewAlpha` | 0.9, 1.618 | Eisenstat-Walker forcing parameters |
-| `residualGrowthFactor` | 4.0 | a jump of the right-hand side by this factor marks a new increment (tolerance and hierarchies reset) |
-| `hierarchyStalenessFactor` | 1.5 | rebuild the AMG hierarchies when a solve needs this many times the previous solve's iterations |
-| `trueResidualMaxContinuations` | **0** | warm restarts to reach the tolerance on the true residual (default 2) |
-| `gapCompensatedTolerance` | **true** | tighten the first pass by the measured gap between scaled and true residual (default false) |
-| `gapSafetyFactor` | 0.3 | safety factor of that tightening |
-| `verbosity` | **info** | `silent`, `warning` (default), `info` or `debug` |
-| `warnOuterIterationsThreshold` | 100 | warn about solves that need more outer iterations |
-| `dumpOnDegradationThreshold`, `dumpOnDegradationMaxDumps`, `dumpOnDegradationContextSolves` | 100, 10, 0 | capture degraded solves for offline diagnosis (only active with `dumpOnDegradationDir`) |
+| `outerTol` | adaptive | the outer tolerance: Eisenstat-Walker forcing between `etaMin` and `etaMax`, or a fixed number |
+| `etaMin`, `etaMax` | 1e-4, 1e-3 | bounds of the adaptive tolerance |
+| `outerRestart` x `outerMaxiter` | 100 x 1 | the outer-iteration cap of one solve; a solve that reaches it rebuilds the hierarchies |
+| `lgmresM`, `lgmresK` | 50, 3 | AMGCL LGMRES: Krylov steps per restart cycle and augmentation vectors |
+| `krylovOnScaledSystem` | false | the outer solve runs on `A` itself, preconditioned by `D M^-1 D`, so its residual is the true one |
+| `sweeps`, `symmetric` | 1, false | one forward block Gauss-Seidel sweep over the fields per preconditioner application |
+| `fieldPreconds` | by field dimension | displacement (3D): smoothed aggregation on node-wise 3x3 blocks stored in float, Chebyshev degree 16; nonlocal damage (scalar): smoothed aggregation, Chebyshev |
+| `hierarchyStalenessFactor` | 3 | rebuild the hierarchies when a solve needs 3 times (and 15 more than) the outer iterations of the solve they were built for |
+| `refreshOnNewIncrement` | true | rebuild the hierarchies when a residual jump marks a new increment (`residualGrowthFactor` 4) |
+| `verbosity` | **info** (default `warning`) | `silent`, `warning`, `info` or `debug` |
 
-Two settings have no value to write down, because they are off by default: `dumpOnDegradationDir`
-(a directory to enable the capture above) and `hotReloadConfigFile` (a JSON file re-read during the
-run, to change settings on the fly).
-
-The two settings that matter most for this model are `symmetric` and `etaMin`. A key blockamg does
-not know -- a typo, say -- stops the run with an error that lists the recognized keys.
+The remaining keys -- p-two-grid (`p1*`), the scaled-system keys (`trueResidualMaxContinuations`,
+`gapCompensatedTolerance`, ...), the degradation dumps and the hot reload -- are off or have no effect
+with these defaults; the theory page lists them all.

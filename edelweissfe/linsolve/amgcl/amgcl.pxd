@@ -28,45 +28,11 @@ from libcpp.string cimport string
 
 
 cdef extern from "amgcl-wrapper.hpp":
-    cdef cppclass LinearSolver:
-        LinearSolver(const char* json_params) except +
-        void solve(int n,
-                   const int* ptr,
-                   const int* col,
-                   const double* val,
-                   const double* rhs,
-                   double* x,
-                   int& iters,
-                   double& error) except +
-        void set_nullspace(const double* B, int rows, int cols) except +
-        void build(int n, const int* ptr, const int* col, const double* val) except +
-        void applyPreconditioner(int n, const double* rhs, double* x) except +
-        string report() except +
-
-    # Same interface, backed by amgcl::backend::builtin<float> -- half the memory traffic in the
-    # smoother apply, at the cost of matrix/hierarchy precision. rhs/x stay double at this
-    # boundary too; the narrowing/widening happens inside the C++ wrapper.
-    cdef cppclass LinearSolverFloat:
-        LinearSolverFloat(const char* json_params) except +
-        void solve(int n,
-                   const int* ptr,
-                   const int* col,
-                   const float* val,
-                   const double* rhs,
-                   double* x,
-                   int& iters,
-                   double& error) except +
-        void set_nullspace(const double* B, int rows, int cols) except +
-        void build(int n, const int* ptr, const int* col, const float* val) except +
-        void applyPreconditioner(int n, const double* rhs, double* x) except +
-        string report() except +
-
-    # Block-valued backends: the matrix stays a plain scalar CSR at this boundary (val is
-    # double, same layout as LinearSolver) -- the wrapper adapts it to node-major B x B blocks
-    # internally via amgcl::adapter::block_matrix. set_nullspace() always throws (AMGCL's own
+    # The interface every AMGCL solver backend implements (scalar or B x B blocks, double or float):
+    # the matrix values and rhs/x are always double at this boundary, each backend converts
+    # internally -- see AMGCLSolverInterface. set_nullspace() throws on a block backend (AMGCL's own
     # tentative-prolongation nullspace path is unimplemented for block value types).
-    cdef cppclass LinearSolverBlock2:
-        LinearSolverBlock2(const char* json_params) except +
+    cdef cppclass AMGCLSolverInterface:
         void solve(int n,
                    const int* ptr,
                    const int* col,
@@ -80,55 +46,39 @@ cdef extern from "amgcl-wrapper.hpp":
         void applyPreconditioner(int n, const double* rhs, double* x) except +
         string report() except +
 
-    cdef cppclass LinearSolverBlock3:
-        LinearSolverBlock3(const char* json_params) except +
-        void solve(int n,
-                   const int* ptr,
-                   const int* col,
-                   const double* val,
-                   const double* rhs,
-                   double* x,
-                   int& iters,
-                   double& error) except +
-        void set_nullspace(const double* B, int rows, int cols) except +
-        void build(int n, const int* ptr, const int* col, const double* val) except +
-        void applyPreconditioner(int n, const double* rhs, double* x) except +
-        string report() except +
+    # The backend for a block size (1, 2 or 3) and value type (float: builtin<float> for scalars,
+    # 3x3 blocks set up in double and stored in float), owned by the caller.
+    AMGCLSolverInterface* makeAMGCLSolver(const char* json_params, int blockSize, bint isFloat) except +
 
-    # A standalone, OpenMP-threaded relaxation smoother -- e.g. the p-two-grid
-    # preconditioner's fine sweep, one level below a full AMG hierarchy. Its own constructor
-    # parameter tree is flat ({"type": "chebyshev", ...}), not nested under "precond.relax".
-    cdef cppclass RelaxationSmoother:
-        RelaxationSmoother(const char* json_params) except +
-        void build(int n, const int* ptr, const int* col, const double* val) except +
-        void applyStep(int n, const double* rhs, double* x) except +
-        void residual(int n, const double* rhs, const double* x, double* r) except +
+    # blockamg's equilibrated, field-split system As = D A D: the outer Krylov operator, the
+    # coupling blocks between fields and, on demand, the diagonal blocks -- built in one threaded
+    # pass, see EquilibratedSystemT's own comment.
+    cdef cppclass EquilibratedSystem:
+        EquilibratedSystem() except +
 
-    # A plain OpenMP-threaded matvec/residual, no smoother -- the outer GMRES operator.
-    cdef cppclass ThreadedMatrix:
-        ThreadedMatrix() except +
-        void build(int n, const int* ptr, const int* col, const double* val) except +
-        void matvec(int n, const double* x, double* y) except +
-        void residual(int n, const double* rhs, const double* x, double* r) except +
-        void buildRect(int nrows, int ncols, const int* ptr, const int* col, const double* val) except +
-        void matvecRect(const double* x, double* y) except +
+        @staticmethod
+        void absoluteDiagonal(int n, const int* ptr, const int* col, const double* val, double* out) except +
+        void build(int n, const int* ptr, const int* col, const double* val, const double* scaling,
+                   int nFields, const int* fieldBounds, bint unscaled) except +
+        int diagonalBlockSize(int f) except +
+        int diagonalBlockNnz(int f) except +
+        void fillDiagonalBlock(int f, int* ptr, int* col, double* val, bint unscaled) except +
+        void matvec(const double* x, double* y, bint unscaled) except +
+        void residual(const double* rhs, const double* x, double* r, bint unscaled) except +
+        void couplingMatvec(int f, int g, const double* x, double* y) except +
+        void diagonalBlockMatvec(int f, const double* x, double* y) except +
 
     # Callback signature bridging AMGCL's native lgmres Krylov loop back into a Python-level
     # preconditioner -- see amgcl-wrapper.hpp's own comment on PyPrecondApplyFn/
     # PyLGMRESPrecondT for why this is a bare function pointer + opaque context rather than a
     # Cython-overridden C++ virtual method.
-    ctypedef void (*PyPrecondApplyFn)(void* ctx, int n, const double* rhs, double* x)
+    ctypedef int (*PyPrecondApplyFn)(void* ctx, int n, const double* rhs, double* x)
 
-    # AMGCL's own native outer Krylov solve, in place of scipy.sparse.linalg.gmres. Persists
-    # its recycled/augmented Krylov vectors across solve() calls on the same instance whenever
-    # always_reset is set to false in the constructor's params -- see LGMRESOuterSolverT's own
-    # comment for why this class is meant to be built once per BlockAMGSolver, not once per solve.
+    # AMGCL's own native outer Krylov solve, in place of scipy.sparse.linalg.gmres; one instance per
+    # system size, no augmentation vectors carried across calls -- see LGMRESOuterSolverT.
     cdef cppclass LGMRESOuterSolver:
         LGMRESOuterSolver(int n, const char* json_params) except +
-        void solve(int n,
-                   const int* ptr,
-                   const int* col,
-                   const double* val,
+        void solve(const EquilibratedSystem& system,
                    const double* rhs,
                    double* x,
                    double tol,
@@ -137,7 +87,7 @@ cdef extern from "amgcl-wrapper.hpp":
                    void* ctx,
                    int& iters,
                    double& error,
-                   bint resetOnce) except +
+                   bint onUnscaledOperator) except +
 
     # OpenMP-threaded sparse-matrix product/sum, wired into
     # edelweissfe/numerics/mpctransformation.py's T^T K T + C condensation as an opt-in alternative
@@ -153,3 +103,29 @@ cdef extern from "amgcl-wrapper.hpp":
         int resultNCols() except +
         int resultNnz() except +
         void copyResult(int* ptrOut, int* colOut, double* valOut) except +
+
+    # The p-two-grid (P1) preconditioner of edelweissfe/linsolve/blockamg/ptwogrid.py, built and
+    # applied entirely in C++ (OpenMP) -- see PTwoGridPreconditionerT's own comment.
+    cdef cppclass PTwoGridPreconditioner:
+        PTwoGridPreconditioner(const char* json_params) except +
+
+        @staticmethod
+        void dirichletRowMask(int n, const int* ptr, const int* col, const double* val, char* isDirichlet) except +
+        void build(int n, const int* ptr, const int* col, const double* val,
+                   int nNodes, const signed char* isCorner, const int* edgeEndpoints,
+                   const double* nullspace, int nullspaceRows, int nullspaceCols,
+                   double spectralRadius, const double* dominantVector, int dominantVectorSize) except +
+        void apply(int n, const double* r, double* x) except +
+        double fineSpectralRadius()
+        int fineSpectralRadiusSource()
+        int fineDominantVectorSize()
+        void copyFineDominantVector(double* out)
+        int nCoarseFree()
+        string report() except +
+        double setupDirichletAndPSeconds_
+        double setupGalerkinSeconds_
+        double setupCoarseSeconds_
+        double setupFineOperatorSeconds_
+        double setupSpectralRadiusSeconds_
+        double applyFineSeconds_
+        double applyCoarseSeconds_

@@ -32,19 +32,72 @@ import scipy.sparse
 cimport numpy as np
 
 
+def _csrArrays(object A):
+    """``A`` as a CSR matrix (converted if needed) and its arrays as C-contiguous int32 row pointers, int32
+    column indices and float64 values -- the form every C++ entry point of this module takes, and the one
+    place their int32 range is checked."""
+    if not scipy.sparse.isspmatrix_csr(A):
+        A = A.tocsr()
+    int32Max = np.iinfo(np.int32).max
+    if max(A.shape) > int32Max or A.nnz > int32Max:
+        raise OverflowError("a {:}x{:} CSR matrix with {:} entries exceeds the int32 range of the AMGCL wrapper".format(
+            A.shape[0], A.shape[1], A.nnz))
+    return (
+        A,
+        np.ascontiguousarray(A.indptr, dtype=np.int32),
+        np.ascontiguousarray(A.indices, dtype=np.int32),
+        np.ascontiguousarray(A.data, dtype=np.float64),
+    )
+
+
+def _vector(object x, int n, str name):
+    """``x`` as a C-contiguous float64 vector of length ``n``. The C++ side reads exactly ``n`` entries without
+    bounds checks, so a wrong length (e.g. a vector of the mesh before adaptive refinement) must raise here."""
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] v = np.ascontiguousarray(x, dtype=np.float64).reshape(-1)
+    if v.shape[0] != n:
+        raise ValueError("{:} has length {:}, expected {:}".format(name, v.shape[0], n))
+    return v
+
+
+cdef inline const int* _intData(const int[::1] values):
+    """The first entry's address, or NULL for an empty array -- bounds checking is off in this module, so an
+    empty array must not be indexed."""
+    return &values[0] if values.shape[0] > 0 else NULL
+
+
+cdef inline const double* _constDoubleData(const double[::1] values):
+    """See :func:`_intData`."""
+    return &values[0] if values.shape[0] > 0 else NULL
+
+
+cdef inline double* _doubleData(double[::1] values):
+    """See :func:`_intData`."""
+    return &values[0] if values.shape[0] > 0 else NULL
+
+
+cdef inline const signed char* _byteData(const signed char[::1] values):
+    """See :func:`_intData`."""
+    return &values[0] if values.shape[0] > 0 else NULL
+
+
+cdef inline char* _writableByteData(signed char[::1] values):
+    """See :func:`_intData` -- for an output array the C++ side writes."""
+    return <char*> &values[0] if values.shape[0] > 0 else NULL
+
+
 cdef class PyAMGCLSolver:
-    cdef LinearSolver* solver
-    cdef LinearSolverFloat* solverFloat
-    cdef LinearSolverBlock2* solverBlock2
-    cdef LinearSolverBlock3* solverBlock3
+    cdef AMGCLSolverInterface* solver
     cdef readonly bint isFloat
-    """True if this instance runs the mixed-precision (builtin<float>) hierarchy."""
+    """True if this instance runs a mixed-precision hierarchy: builtin<float> for the scalar backend, or
+    3x3 blocks set up in double but stored in float (``LinearSolverBlock3Float``) for block size 3."""
     cdef readonly int blockSize
     """1 (scalar, default), 2, or 3 -- the AMGCL backend's block size."""
     cdef readonly int lastIterations
     """The iteration count AMGCL reported for the most recent solve, -1 before the first."""
     cdef readonly double lastError
     """The relative residual AMGCL reported for the most recent solve, NaN before the first."""
+    cdef readonly int n
+    """The size of the matrix of the last :meth:`build`, -1 before the first."""
 
     def __cinit__(self, dict params=None):
         """
@@ -63,11 +116,19 @@ cdef class PyAMGCLSolver:
 
         ``backendBlockSize``: ``1`` (default, scalar), ``2``, or ``3``. Selects a block-valued backend
         operating on node-major B x B nodal blocks instead of scalar entries -- shrinks the
-        CSR index traffic by ~B² and lets block-aware smoothers (block-ILU0, block-GS) invert each
-        node's coupling exactly. The matrix still arrives as a plain scalar CSR; the wrapper adapts it
-        internally. Not yet combinable with ``backendPrecision == "float"`` (raises) -- float-block is
-        a follow-up, not implemented in this pass. :meth:`set_nullspace` always raises on a block
-        backend -- AMGCL's own near-null-space path is unimplemented for block value types.
+        CSR index traffic by ~B² and, with ``backendPrecision == "double"`` (block size 2 or 3), lets
+        block-aware smoothers (block-ILU0, block-GS) invert each node's coupling exactly: both run on
+        plain ``amgcl::backend::builtin<BlockType>``, the same backend the scalar solver uses, just over
+        B x B blocks instead of scalar entries. The matrix still arrives as a plain scalar CSR; the
+        wrapper adapts it internally. With ``backendPrecision == "float"``, block size 3
+        (``LinearSolverBlock3Float``) sets the hierarchy up in double -- coarsening, Galerkin products
+        and every Chebyshev spectral-radius estimate -- and stores only the level matrices the cycle
+        reads in float, with double vectors and double accumulation; on *that* backend block-GS is
+        unsupported (AMGCL rejects it at construction, since the float-stored level matrices do not
+        provide a row iterator) and block-ILU0/ILUk/ILUT/ILUP fall back to AMGCL's generic approximate
+        triangular solve instead of the exact one plain ``builtin`` gets. Block size 2 with float raises.
+        :meth:`set_nullspace` always raises on a block backend -- AMGCL's own near-null-space path is
+        unimplemented for block value types.
 
         Example params:
         {
@@ -96,39 +157,23 @@ cdef class PyAMGCLSolver:
         if blockSize not in (1, 2, 3):
             raise ValueError(f"backendBlockSize must be 1, 2, or 3, got {blockSize!r}")
         self.blockSize = blockSize
-        if self.blockSize > 1 and self.isFloat:
+        if self.blockSize == 2 and self.isFloat:
             raise NotImplementedError(
-                "backendBlockSize > 1 combined with backendPrecision='float' is not implemented."
+                "backendBlockSize 2 combined with backendPrecision='float' is not implemented."
             )
 
         self.lastIterations = -1
         self.lastError = float("nan")
+        self.n = -1
 
         # Convert dict to JSON string for C++
         cdef bytes json_bytes = json.dumps(params).encode("utf-8")
         cdef const char* c_json = json_bytes
-        self.solver = NULL
-        self.solverFloat = NULL
-        self.solverBlock2 = NULL
-        self.solverBlock3 = NULL
-        if self.blockSize == 2:
-            self.solverBlock2 = new LinearSolverBlock2(c_json)
-        elif self.blockSize == 3:
-            self.solverBlock3 = new LinearSolverBlock3(c_json)
-        elif self.isFloat:
-            self.solverFloat = new LinearSolverFloat(c_json)
-        else:
-            self.solver = new LinearSolver(c_json)
+        self.solver = makeAMGCLSolver(c_json, self.blockSize, self.isFloat)
 
     def __dealloc__(self):
         if self.solver != NULL:
             del self.solver
-        if self.solverFloat != NULL:
-            del self.solverFloat
-        if self.solverBlock2 != NULL:
-            del self.solverBlock2
-        if self.solverBlock3 != NULL:
-            del self.solverBlock3
 
     def set_nullspace(self, object B):
         """
@@ -150,64 +195,23 @@ cdef class PyAMGCLSolver:
         cdef int cols = B_arr.shape[1]
         cdef double[:, ::1] B_view
         if cols == 0:
-            if self.blockSize == 2:
-                self.solverBlock2.set_nullspace(<const double*> 0, rows, 0)
-            elif self.blockSize == 3:
-                self.solverBlock3.set_nullspace(<const double*> 0, rows, 0)
-            elif self.isFloat:
-                self.solverFloat.set_nullspace(<const double*> 0, rows, 0)
-            else:
-                self.solver.set_nullspace(<const double*> 0, rows, 0)
+            self.solver.set_nullspace(<const double*> 0, rows, 0)
             return
         B_view = B_arr
-        if self.blockSize == 2:
-            self.solverBlock2.set_nullspace(&B_view[0, 0], rows, cols)
-        elif self.blockSize == 3:
-            self.solverBlock3.set_nullspace(&B_view[0, 0], rows, cols)
-        elif self.isFloat:
-            self.solverFloat.set_nullspace(&B_view[0, 0], rows, cols)
-        else:
-            self.solver.set_nullspace(&B_view[0, 0], rows, cols)
+        self.solver.set_nullspace(&B_view[0, 0], rows, cols)
 
     def build(self, object A):
         """
         Build the AMG hierarchy for A once, for repeated preconditioner application via
         :meth:`applyPreconditioner` -- the build-once / apply-many split :meth:`solve` fuses.
 
-        A: scipy.sparse.csr_matrix. Its values narrow to float32 first if ``backendPrecision ==
-        "float"`` -- cheap here (build() runs once per solve, not once per outer Krylov iteration). A
-        block backend (``blockSize > 1``) instead takes the plain scalar CSR unchanged and adapts it
-        to node-major blocks inside the C++ wrapper.
+        A: scipy.sparse.csr_matrix, passed as double; a float backend rounds its values inside the C++
+        wrapper (build() runs once per solve, not once per outer Krylov iteration), and a block
+        backend (``blockSize > 1``) adapts the scalar CSR to node-major blocks there.
         """
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-
-        cdef int n = A.shape[0]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef int[::1] indptr_ = indptr
-        cdef int[::1] indices_ = indices
-
-        cdef np.ndarray[np.float32_t, ndim=1, mode="c"] dataFloat
-        cdef float[::1] dataFloat_
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data
-        cdef double[::1] data_
-
-        if self.blockSize == 2 or self.blockSize == 3:
-            data = np.ascontiguousarray(A.data, dtype=np.float64)
-            data_ = data
-            if self.blockSize == 2:
-                self.solverBlock2.build(n, &indptr_[0], &indices_[0], &data_[0])
-            else:
-                self.solverBlock3.build(n, &indptr_[0], &indices_[0], &data_[0])
-        elif self.isFloat:
-            dataFloat = np.ascontiguousarray(A.data, dtype=np.float32)
-            dataFloat_ = dataFloat
-            self.solverFloat.build(n, &indptr_[0], &indices_[0], &dataFloat_[0])
-        else:
-            data = np.ascontiguousarray(A.data, dtype=np.float64)
-            data_ = data
-            self.solver.build(n, &indptr_[0], &indices_[0], &data_[0])
+        A, indptr, indices, data = _csrArrays(A)
+        self.solver.build(A.shape[0], _intData(indptr), _intData(indices), _constDoubleData(data))
+        self.n = A.shape[0]
 
     def applyPreconditioner(self, object rhs):
         """
@@ -217,20 +221,9 @@ cdef class PyAMGCLSolver:
         any backend-specific narrowing/widening or block reinterpretation happens inside the C++
         wrapper, not here, since this is called once per outer Krylov iteration.
         """
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
-        cdef int n = rhs_arr.shape[0]
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x = np.zeros(n, dtype=np.float64)
-
-        cdef double[::1] rhs_ = rhs_arr
-        cdef double[::1] x_ = x
-        if self.blockSize == 2:
-            self.solverBlock2.applyPreconditioner(n, &rhs_[0], &x_[0])
-        elif self.blockSize == 3:
-            self.solverBlock3.applyPreconditioner(n, &rhs_[0], &x_[0])
-        elif self.isFloat:
-            self.solverFloat.applyPreconditioner(n, &rhs_[0], &x_[0])
-        else:
-            self.solver.applyPreconditioner(n, &rhs_[0], &x_[0])
+        rhsArray = _vector(rhs, self.n, "rhs")
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x = np.zeros(self.n, dtype=np.float64)
+        self.solver.applyPreconditioner(self.n, _constDoubleData(rhsArray), _doubleData(x))
         return x
 
     def report(self):
@@ -240,12 +233,6 @@ cdef class PyAMGCLSolver:
 
         Raises RuntimeError if nothing has been built yet.
         """
-        if self.blockSize == 2:
-            return self.solverBlock2.report().decode("utf-8")
-        if self.blockSize == 3:
-            return self.solverBlock3.report().decode("utf-8")
-        if self.isFloat:
-            return self.solverFloat.report().decode("utf-8")
         return self.solver.report().decode("utf-8")
 
     def solve(self, object A, object rhs):
@@ -253,92 +240,14 @@ cdef class PyAMGCLSolver:
         A: scipy.sparse.csr_matrix
         rhs: array-like, will be converted to 1D float64 (C-contiguous)
         """
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.asarray(rhs, dtype=np.float64, order="C")
-        if rhs_arr.ndim != 1:
-            raise ValueError("rhs must be a 1D array-like")
-
+        A, indptr, indices, data = _csrArrays(A)
         cdef int n = A.shape[0]
-        if rhs_arr.shape[0] != n:
-            raise ValueError(f"Dimension mismatch: Matrix {n}x{n}, RHS {rhs_arr.shape[0]}")
-        if n > np.iinfo(np.int32).max:
-            raise OverflowError(f"Matrix dimension {n} exceeds supported int32 range for AMGCL wrapper")
-
-        cdef long long int32_max = np.iinfo(np.int32).max
-        cdef long long nnz = A.nnz
-        if nnz > int32_max:
-            raise OverflowError(f"CSR nnz value {nnz} exceeds supported int32 range for AMGCL wrapper")
-        if int(A.indptr.min()) < 0:
-            raise OverflowError("CSR indptr contains negative values, which are unsupported")
-        if A.indices.size > 0:
-            if int(A.indices.max()) > int32_max:
-                raise OverflowError("CSR indices contain values that exceed int32 range for AMGCL wrapper")
-            if int(A.indices.min()) < 0:
-                raise OverflowError("CSR indices contain negative values, which are unsupported")
-
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = A.indptr.astype(np.int32, copy=False)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = A.indices.astype(np.int32, copy=False)
-
-        # Ensure contiguous (astype might return non-contiguous if copy=False was possible)
-        if not indptr.flags["C_CONTIGUOUS"]:
-            indptr = np.ascontiguousarray(indptr)
-        if not indices.flags["C_CONTIGUOUS"]:
-            indices = np.ascontiguousarray(indices)
-
+        rhsArray = _vector(rhs, n, "rhs")
         cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x = np.zeros(n, dtype=np.float64)
-
         cdef int iters = 0
         cdef double error = 0.0
-
-        cdef int[::1] indptr_ = indptr
-        cdef int[::1] indices_ = indices
-        cdef double[::1] rhs_ = rhs_arr
-        cdef double[::1] x_ = x
-
-        cdef np.ndarray[np.float32_t, ndim=1, mode="c"] dataFloat
-        cdef float[::1] dataFloat_
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data
-        cdef double[::1] data_
-
-        if self.blockSize == 2 or self.blockSize == 3:
-            data = np.ascontiguousarray(A.data, dtype=np.float64)
-            data_ = data
-            if self.blockSize == 2:
-                self.solverBlock2.solve(
-                        n, &indptr_[0], &indices_[0], &data_[0], &rhs_[0], &x_[0], iters, error
-                    )
-            else:
-                self.solverBlock3.solve(
-                        n, &indptr_[0], &indices_[0], &data_[0], &rhs_[0], &x_[0], iters, error
-                    )
-        elif self.isFloat:
-            dataFloat = np.ascontiguousarray(A.data, dtype=np.float32)
-            dataFloat_ = dataFloat
-            self.solverFloat.solve(
-                    n,
-                    &indptr_[0],
-                    &indices_[0],
-                    &dataFloat_[0],
-                    &rhs_[0],
-                    &x_[0],
-                    iters,
-                    error
-                )
-        else:
-            data = np.ascontiguousarray(A.data, dtype=np.float64)
-            data_ = data
-            self.solver.solve(
-                    n,
-                    &indptr_[0],
-                    &indices_[0],
-                    &data_[0],
-                    &rhs_[0],
-                    &x_[0],
-                    iters,
-                    error
-                )
+        self.solver.solve(n, _intData(indptr), _intData(indices), _constDoubleData(data), _constDoubleData(rhsArray),
+                          _doubleData(x), iters, error)
 
         # AMGCL reports these by reference and they were being dropped on the floor, which left an
         # unconverged solve indistinguishable from a converged one: an iterative solver that hits
@@ -350,169 +259,119 @@ cdef class PyAMGCLSolver:
         return x
 
 
-cdef class PyAMGCLRelaxationSmoother:
-    """A standalone, OpenMP-threaded relaxation smoother -- e.g. the p-two-grid
-    preconditioner's fine sweep (:mod:`edelweissfe.linsolve.blockamg.ptwogrid`), one level below a
-    full AMG hierarchy. Wraps ``amgcl::runtime::relaxation::wrapper``, which is itself
-    runtime-selectable via the ``type`` key (``chebyshev``, ``gauss_seidel``, ``ilu0``, ``spai0``,
-    ...) -- the same smoother catalogue as a hierarchy's own ``relax`` sub-tree, just applied directly
-    as a preconditioner-shaped object instead of on an AMG level.
+cdef class PyAMGCLEquilibratedSystem:
+    """blockamg's equilibrated, field-split system ``As = D A D`` (``D = diag(scaling)``), built in one
+    OpenMP-threaded pass over ``A``: the outer Krylov operator (:meth:`matvec`, :meth:`residual`, and
+    the operator :meth:`PyAMGCLLGMRESSolver.solve` iterates on), the coupling blocks between fields
+    (:meth:`couplingMatvec`) and, on demand, a field's diagonal block (:meth:`diagonalBlock`).
 
-    Unlike :class:`PyAMGCLSolver`, this exposes a single in-place smoothing step
-    (:meth:`applyStep`, ``amgcl``'s ``apply_pre``) rather than a full solve: callers decide "start
-    from zero" (zero ``x`` themselves) and "how many sweeps" (call :meth:`applyStep` repeatedly) --
-    see :mod:`ptwogrid`'s ``smooth(x, rhs, sweeps)`` closure.
+    Replaces a chain of serial SciPy operations -- a full copy of ``A`` scaled in place, a threaded
+    copy of that for the operator, row and column slices for every coupling and diagonal block --
+    measured as a non-trivial share of every solve on a large coupled system. The operator is bitwise
+    the former one (see ``EquilibratedSystemT`` in ``amgcl-wrapper.hpp``).
     """
-    cdef RelaxationSmoother* smoother
-
-    def __cinit__(self, dict params):
-        """
-        params: the relaxation's own flat parameter tree, e.g.
-        {"type": "chebyshev", "degree": 5, "power_iters": 50, "lower": 0.01}
-        -- not nested under "precond.relax" like :class:`PyAMGCLSolver`, since there is no hierarchy
-        here.
-        """
-        cdef bytes json_bytes = json.dumps(params).encode("utf-8")
-        cdef const char* c_json = json_bytes
-        self.smoother = new RelaxationSmoother(c_json)
-
-    def __dealloc__(self):
-        if self.smoother != NULL:
-            del self.smoother
-
-    def build(self, object A):
-        """Build the smoother for A once, for repeated :meth:`applyStep` calls. A: scipy.sparse
-        csr_matrix."""
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-
-        cdef int n = A.shape[0]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
-        cdef int[::1] indptr_ = indptr
-        cdef int[::1] indices_ = indices
-        cdef double[::1] data_ = data
-        self.smoother.build(n, &indptr_[0], &indices_[0], &data_[0])
-
-    def applyStep(self, object x, object rhs):
-        """One in-place smoothing step: ``x`` is updated in place, continuing the relaxation's own
-        recursion from its current value (zero it first for a from-zero application). ``x`` must be a
-        1D float64 (C-contiguous) numpy array; ``rhs`` is converted to the same."""
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = x
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
-        cdef int n = x_arr.shape[0]
-        cdef double[::1] x_ = x_arr
-        cdef double[::1] rhs_ = rhs_arr
-        self.smoother.applyStep(n, &rhs_[0], &x_[0])
-
-    def residual(self, object rhs, object x):
-        """``rhs - A@x`` on the same OpenMP-threaded backend matrix :meth:`build` already converted --
-        a plain ``scipy.sparse`` CSR matvec is not thread-parallel regardless of ``OMP_NUM_THREADS``
-        so callers computing the fine-level residual for a two-grid restriction should use
-        this instead of ``A @ x`` in Python. Returns a new float64 array; does not mutate ``x``."""
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
-        cdef int n = rhs_arr.shape[0]
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] r = np.empty(n, dtype=np.float64)
-        cdef double[::1] rhs_ = rhs_arr
-        cdef double[::1] x_ = x_arr
-        cdef double[::1] r_ = r
-        self.smoother.residual(n, &rhs_[0], &x_[0], &r_[0])
-        return r
-
-
-cdef class PyAMGCLMatrix:
-    """A plain OpenMP-threaded matvec/residual wrapper, no smoother attached.
-
-    The shipped default's outer GMRES operator (``gmres(As, bs, ...)`` in
-    :mod:`edelweissfe.linsolve.blockamg.blockamg`) previously called ``As`` directly as a
-    ``scipy.sparse`` CSR matrix -- not thread-parallel regardless of ``OMP_NUM_THREADS`` (scipy
-    sparse matvec is single-threaded C code; measured at ~15% of the shipped arm's own wall-clock on
-    a real reference model). Wrap ``As`` once per solve with
-    :meth:`build`, then pass ``scipy.sparse.linalg.LinearOperator(matvec=this.matvec)`` as the
-    operator instead of ``As`` itself.
-    """
-    cdef ThreadedMatrix* matrix
-    cdef int _nrows
+    cdef EquilibratedSystem* system
+    cdef readonly int n
+    """The system size."""
 
     def __cinit__(self):
-        self.matrix = new ThreadedMatrix()
-        self._nrows = 0
+        self.system = new EquilibratedSystem()
+        self.n = 0
 
     def __dealloc__(self):
-        if self.matrix != NULL:
-            del self.matrix
+        if self.system != NULL:
+            del self.system
 
-    def build(self, object A):
-        """Convert A (scipy.sparse csr_matrix) once. Not amortized across solves -- this pattern's
-        sparsity churns every solve on a model with contact/tie constraints, so the conversion is
-        paid fresh every call."""
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-
+    @staticmethod
+    def absoluteDiagonal(object A):
+        """``abs(A.diagonal())`` of a scipy.sparse CSR matrix, threaded."""
+        A, indptr, indices, data = _csrArrays(A)
         cdef int n = A.shape[0]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
-        cdef int[::1] indptr_ = indptr
-        cdef int[::1] indices_ = indices
-        cdef double[::1] data_ = data
-        self.matrix.build(n, &indptr_[0], &indices_[0], &data_[0])
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] out = np.empty(n, dtype=np.float64)
+        EquilibratedSystem.absoluteDiagonal(n, _intData(indptr), _intData(indices), _constDoubleData(data),
+                                            _doubleData(out))
+        return out
 
-    def matvec(self, object x):
-        """Returns A @ x as a new float64 array."""
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
-        cdef int n = x_arr.shape[0]
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(n, dtype=np.float64)
-        cdef double[::1] x_ = x_arr
-        cdef double[::1] y_ = y
-        self.matrix.matvec(n, &x_[0], &y_[0])
-        return y
-
-    def buildRect(self, object A):
-        """Convert a *rectangular* A (scipy.sparse csr_matrix, nrows x ncols) for matvecRect().
-
-        Needed for the off-diagonal field-coupling blocks of blockamg's block Gauss-Seidel sweep:
-        build()/matvec() above assume a square operator and size the output by the input length.
+    def build(self, object A, object scaling, object fieldBounds, bint unscaled=False):
         """
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
+        A: scipy.sparse csr_matrix (square); scaling: the equilibration, length n; fieldBounds: a
+        sequence of ``(start, stop)`` DOF ranges, one per field, disjoint. unscaled: store A itself instead
+        of ``As``, for :meth:`matvec`/:meth:`residual` with ``unscaled`` and an outer solve on it; the blocks of
+        ``As`` are the same either way.
+        """
+        if A.shape[0] != A.shape[1]:
+            raise ValueError("A must be square, got shape {:}".format(A.shape))
+        A, indptr, indices, data = _csrArrays(A)
+        cdef int n = A.shape[0]
+        scalingArray = _vector(scaling, n, "scaling")
+        bounds = np.ascontiguousarray(np.asarray(fieldBounds, dtype=np.int32).reshape(-1))
+        if bounds.shape[0] % 2:
+            raise ValueError("fieldBounds must be (start, stop) pairs, got {:} numbers".format(bounds.shape[0]))
+        self.system.build(n, _intData(indptr), _intData(indices), _constDoubleData(data),
+                          _constDoubleData(scalingArray), bounds.shape[0] // 2, _intData(bounds), unscaled)
+        self.n = n
 
-        cdef int nrows = A.shape[0]
-        cdef int ncols = A.shape[1]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
+    def diagonalBlock(self, int field, bint unscaled=False):
+        """``As[field, field]`` -- or with ``unscaled`` ``A[field, field]``, exactly A's entries if :meth:`build`
+        stored A -- as a new scipy.sparse csr_matrix (sorted columns if ``A``'s were)."""
+        cdef int size = self.system.diagonalBlockSize(field)
+        cdef int nnz = self.system.diagonalBlockNnz(field)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.empty(size + 1, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.empty(max(nnz, 1), dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.empty(max(nnz, 1), dtype=np.float64)
         cdef int[::1] indptr_ = indptr
         cdef int[::1] indices_ = indices
         cdef double[::1] data_ = data
-        self.matrix.buildRect(nrows, ncols, &indptr_[0], &indices_[0], &data_[0])
-        self._nrows = nrows
+        self.system.fillDiagonalBlock(field, &indptr_[0], &indices_[0], &data_[0], unscaled)
+        return scipy.sparse.csr_matrix((data[:nnz], indices[:nnz], indptr), shape=(size, size), copy=False)
 
-    def matvecRect(self, object x):
-        """Returns A @ x (length nrows) for a matrix built with buildRect()."""
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(self._nrows, dtype=np.float64)
-        cdef double[::1] x_ = x_arr
-        cdef double[::1] y_ = y
-        self.matrix.matvecRect(&x_[0], &y_[0])
+    def matvec(self, object x, bint unscaled=False):
+        """Returns ``As @ x`` -- or with ``unscaled``, ``A @ x`` -- as a new float64 array: the operator
+        :meth:`build` stored."""
+        xArray = _vector(x, self.n, "x")
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(self.n, dtype=np.float64)
+        self.system.matvec(_constDoubleData(xArray), _doubleData(y), unscaled)
         return y
 
-    def residual(self, object rhs, object x):
-        """Returns rhs - A @ x as a new float64 array."""
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
-        cdef int n = rhs_arr.shape[0]
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] r = np.empty(n, dtype=np.float64)
-        cdef double[::1] rhs_ = rhs_arr
-        cdef double[::1] x_ = x_arr
-        cdef double[::1] r_ = r
-        self.matrix.residual(n, &rhs_[0], &x_[0], &r_[0])
+    def residual(self, object rhs, object x, bint unscaled=False):
+        """Returns ``rhs - As @ x`` -- or with ``unscaled``, ``rhs - A @ x`` -- as a new float64 array."""
+        rhsArray, xArray = _vector(rhs, self.n, "rhs"), _vector(x, self.n, "x")
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] r = np.empty(self.n, dtype=np.float64)
+        self.system.residual(_constDoubleData(rhsArray), _constDoubleData(xArray), _doubleData(r), unscaled)
         return r
 
+    def diagonalBlockMatvec(self, int field, object x):
+        """Returns ``As[field, field] @ x`` as a new float64 array of this field's size."""
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
+        if x_arr.shape[0] != self.system.diagonalBlockSize(field):
+            raise ValueError("x has the wrong length for field {:}".format(field))
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(x_arr.shape[0], dtype=np.float64)
+        if x_arr.shape[0] == 0:
+            return y
+        cdef double[::1] x_ = x_arr
+        cdef double[::1] y_ = y
+        self.system.diagonalBlockMatvec(field, &x_[0], &y_[0])
+        return y
 
-cdef void _lgmresPrecondApplyTrampoline(void* ctx, int n, const double* rhs, double* x) noexcept:
+    def couplingMatvec(self, int field, int otherField, object x):
+        """Returns ``As[field, otherField] @ x`` (``x`` of the other field's size) as a new float64
+        array of this field's size."""
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
+        if x_arr.shape[0] != self.system.diagonalBlockSize(otherField):
+            raise ValueError("x has the wrong length for field {:}".format(otherField))
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(
+            self.system.diagonalBlockSize(field), dtype=np.float64
+        )
+        cdef double[::1] x_ = x_arr
+        cdef double[::1] y_ = y
+        if x_arr.shape[0] == 0 or y.shape[0] == 0:
+            y[:] = 0.0
+            return y
+        self.system.couplingMatvec(field, otherField, &x_[0], &y_[0])
+        return y
+
+
+cdef int _lgmresPrecondApplyTrampoline(void* ctx, int n, const double* rhs, double* x) noexcept:
     """The C-callable trampoline bridging amgcl::solver::lgmres's per-``apply()`` Precond callback
     back into Python -- passed to :class:`LGMRESOuterSolver` as a bare function pointer (see
     ``amgcl-wrapper.hpp``'s ``PyPrecondApplyFn``/``PyLGMRESPrecondT``).
@@ -534,22 +393,24 @@ cdef void _lgmresPrecondApplyTrampoline(void* ctx, int n, const double* rhs, dou
     codebase's actual threading model does not use.
 
     A Python exception raised by the preconditioner callable cannot propagate through this C
-    function-pointer boundary (there is no C++ exception handler on the AMGCL side expecting one), so
-    it is caught here and stashed on the calling instance instead; :meth:`PyAMGCLLGMRESSolver.solve`
-    re-raises it once the (now-abandoned) AMGCL call returns. ``x`` is zeroed on that path so the
-    (about-to-be-discarded) AMGCL iteration continues on defined, if meaningless, numbers rather than
-    whatever uninitialized/stale data happened to be there.
+    function-pointer boundary, so it is caught here and stashed on the calling instance instead, and the
+    function returns 1 (0 on success). The C++ side then throws, which ends AMGCL's lgmres at once, and
+    :meth:`PyAMGCLLGMRESSolver.solve` re-raises the stashed exception in place of the C++ one.
     """
     cdef PyAMGCLLGMRESSolver self = <PyAMGCLLGMRESSolver> ctx
     cdef Py_ssize_t i
     # rhs arrives as a `const double*` (it is AMGCL's own internal Arnoldi-vector storage, never meant
     # to be written through) -- copied element-by-element into a fresh, ordinary (non-const) numpy
     # array rather than wrapped in a zero-copy memoryview, which would need casting away the pointer's
-    # constness. n is at most the outer Krylov restart length, so this copy is not the cost driver
-    # here -- the Python-level preconditioner call below is.
-    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhsArr = np.empty(n, dtype=np.float64)
+    # constness. n is the system size, so this is one pass over a vector per preconditioner
+    # application -- small against the application itself (a block Gauss-Seidel sweep of AMG cycles),
+    # which reads every matrix entry at least once.
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhsArr
     cdef double[::1] xView
     try:
+        # inside the try: a MemoryError here must be stashed and re-raised like any other failure, not
+        # swallowed by this noexcept function, which would leave x stale and the solve "successful"
+        rhsArr = np.empty(n, dtype=np.float64)
         for i in range(n):
             rhsArr[i] = rhs[i]
         result = self._precondCallable(rhsArr)
@@ -563,8 +424,8 @@ cdef void _lgmresPrecondApplyTrampoline(void* ctx, int n, const double* rhs, dou
             x[i] = xView[i]
     except BaseException as exc:
         self._pendingException = exc
-        for i in range(n):
-            x[i] = 0.0
+        return 1
+    return 0
 
 
 cdef class PyAMGCLLGMRESSolver:
@@ -578,18 +439,10 @@ cdef class PyAMGCLLGMRESSolver:
     PTwoGridPreconditioner` objects) to AMGCL's native ``Precond`` interface via
     :func:`_lgmresPrecondApplyTrampoline`, called once per Arnoldi vector.
 
-    One instance should be constructed once per ``BlockAMGSolver`` and reused for that solver's entire
-    lifetime (see ``blockamg.py``'s construction site), not rebuilt per solve -- this lets tol/maxiter
-    be mutated per call onto the same object without paying construction cost every solve (see
-    :meth:`solve`), independent of ``always_reset``. ``always_reset: false`` would additionally let
-    AMGCL's own recycled/augmented Krylov vectors survive *across* separate :meth:`solve` calls, but
-    an attribution ablation and a live gate found that recycling contributes nothing measurable and
-    can actively compound a struggling solve's poorly-conditioned
-    subspace into a much more expensive (or NaN) subsequent one -- ``blockamg.py`` now defaults
-    ``always_reset=True`` accordingly; this class still earns its keep over plain scipy GMRES from
-    threading and lgmres's own intra-call restart-cycle augmentation alone. The problem size ``n`` is
-    fixed at construction (AMGCL preallocates every scratch vector for it); a field-structure/dof-count
-    change needs a fresh instance.
+    One instance per system size (AMGCL preallocates every scratch vector for it), reused across solves
+    with per-call tolerances. Every call starts from an empty augmentation subspace (``always_reset`` is
+    forced): carrying the augmentation vectors across calls was measured to buy nothing and to turn a
+    struggling solve's subspace into much more expensive or NaN subsequent ones, so it is not offered.
     """
     cdef LGMRESOuterSolver* solver
     cdef readonly int n
@@ -597,8 +450,10 @@ cdef class PyAMGCLLGMRESSolver:
     cdef readonly int lastIterations
     """The iteration count AMGCL's lgmres reported for the most recent solve, -1 before the first."""
     cdef readonly double lastError
-    """The relative (preconditioned) residual AMGCL's lgmres reported for the most recent solve, NaN
-    before the first."""
+    """The relative residual ``||rhs - Op x|| / ||rhs||`` AMGCL's lgmres reached in the most recent solve,
+    recomputed at its exit, of the operator it iterated on: the equilibrated system, so not the true
+    residual, or with ``onUnscaledOperator`` the unscaled one. lgmres's own convergence test is this
+    value below ``tol``. NaN before the first solve."""
     cdef object _precondCallable
     cdef object _pendingException
 
@@ -608,7 +463,8 @@ cdef class PyAMGCLLGMRESSolver:
             The fixed problem size this instance is built for.
         params
             AMGCL's own ``lgmres::params`` field names, forwarded verbatim as JSON (``M``, ``K``,
-            ``always_reset``, ``pside``, ``maxiter``, ``tol``, ``abstol``, ``ns_search``, ``verbose``)
+            ``maxiter``, ``tol``, ``abstol``, ``ns_search``, ``verbose``; ``always_reset`` is forced to true
+            and ``pside`` to right preconditioning)
             -- unlike :class:`PyAMGCLSolver`, there is no ``precond``/``solver`` nesting here, since
             this wraps a single ``amgcl::solver::lgmres`` object directly, not ``amgcl::make_solver``.
             ``maxiter``/``tol`` given here only set the *initial* defaults -- :meth:`solve` overrides
@@ -630,40 +486,33 @@ cdef class PyAMGCLLGMRESSolver:
         if self.solver != NULL:
             del self.solver
 
-    def solve(self, object A, object rhs, object applyPreconditioner, double tol, int maxiter, object x0=None,
-              bint resetOnce=False):
+    def solve(self, PyAMGCLEquilibratedSystem system, object rhs, object applyPreconditioner, double tol,
+              int maxiter, object x0=None, bint onUnscaledOperator=False):
         """
-        A
-            scipy.sparse.csr_matrix, this solve's (equilibrated) full coupled operator -- converted
-            fresh every call (its pattern churns every solve, same as :class:`PyAMGCLMatrix`; only the
-            recycled Krylov *vectors* persist across calls, never a cached matrix conversion).
+        system
+            This solve's equilibrated full coupled operator -- or, with ``onUnscaledOperator``, the
+            unscaled one it stored (``build(..., unscaled=True)``).
         rhs
             array-like, converted to 1D float64 (C-contiguous).
         applyPreconditioner
             A Python callable, ``residual (1D float64 array) -> correction (1D float64 array)`` --
             exactly :mod:`~edelweissfe.linsolve.blockamg.blockamg`'s ``blockGaussSeidel`` closure's own
-            shape. Called once per Arnoldi vector via :func:`_lgmresPrecondApplyTrampoline`; any
-            exception it raises is re-raised here once the (now-abandoned) AMGCL call returns.
+            shape. Called once per Arnoldi vector via :func:`_lgmresPrecondApplyTrampoline`; an
+            exception it raises ends the AMGCL call at once and is re-raised here.
         tol, maxiter
             This call's relative residual tolerance and maximum total Arnoldi iterations (across every
             internal restart -- AMGCL's own ``maxiter`` semantics differ from scipy's restart x maxiter,
-            see blockamg.py's call site). Mutates the underlying ``amgcl::solver::lgmres`` object's own
-            ``prm`` in place rather than reconstructing it, so the recycled Krylov vectors survive.
+            see blockamg.py's call site), set on the underlying ``amgcl::solver::lgmres`` object's own
+            ``prm`` for this call.
         x0
             Optional initial guess (warm start), e.g. blockamg.py's true-residual continuation retry.
             Defaults to zero.
-        resetOnce
-            Discard this instance's recycled/augmented Krylov vectors for this call only
-            (by temporarily flipping the underlying solver's ``prm.always_reset`` to true and restoring
-            it immediately after -- see ``amgcl-wrapper.hpp``'s ``LGMRESOuterSolverT::solve`` for why
-            this reuses AMGCL's own reset mechanism rather than touching ``outer_v`` directly), without
-            discarding this persistent instance itself. Default ``False`` -- recycling continues
-            uninterrupted unless a caller explicitly asks for a one-shot reset.
-        """
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
 
-        cdef int n = A.shape[0]
+        AMGCL's lgmres returns ``x = 0`` at once for ``||rhs|| < 2 eps`` (about 4.4e-16), whatever the units of
+        the system. So the solve runs on ``rhs`` (and ``x0``) scaled by a power of two to a norm in [0.5, 1), and
+        its solution is scaled back: exact in floating point, so the iterates are those of the unscaled solve.
+        """
+        cdef int n = system.n
         if n != self.n:
             raise ValueError(
                 "PyAMGCLLGMRESSolver: matrix size {:} does not match the size {:} this instance was "
@@ -671,20 +520,18 @@ cdef class PyAMGCLLGMRESSolver:
                 "change.".format(n, self.n)
             )
 
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = _vector(rhs, n, "rhs")
 
         cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x
         if x0 is None:
             x = np.zeros(n, dtype=np.float64)
         else:
-            x = np.ascontiguousarray(x0, dtype=np.float64).copy()
+            x = _vector(x0, n, "x0").copy()
 
-        cdef int[::1] indptr_ = indptr
-        cdef int[::1] indices_ = indices
-        cdef double[::1] data_ = data
+        cdef int exponent = np.frexp(np.linalg.norm(rhs_arr))[1]
+        rhs_arr = np.ldexp(rhs_arr, -exponent)
+        x = np.ldexp(x, -exponent)
+
         cdef double[::1] rhs_ = rhs_arr
         cdef double[::1] x_ = x
 
@@ -700,9 +547,13 @@ cdef class PyAMGCLLGMRESSolver:
         cdef void* ctx = <void*> self
         try:
             self.solver.solve(
-                n, &indptr_[0], &indices_[0], &data_[0], &rhs_[0], &x_[0],
-                tol, maxiter, _lgmresPrecondApplyTrampoline, ctx, iters, error, resetOnce
+                system.system[0], &rhs_[0], &x_[0],
+                tol, maxiter, _lgmresPrecondApplyTrampoline, ctx, iters, error, onUnscaledOperator
             )
+        except RuntimeError:
+            # the C++ side's report of a failed callback: raise the callback's own exception instead
+            if self._pendingException is None:
+                raise
         finally:
             self._precondCallable = None
 
@@ -713,7 +564,7 @@ cdef class PyAMGCLLGMRESSolver:
 
         self.lastIterations = iters
         self.lastError = error
-        return x
+        return np.ldexp(x, exponent)
 
 
 cdef class PyAMGCLSpGEMM:
@@ -759,48 +610,144 @@ cdef class PyAMGCLSpGEMM:
 
     def product(self, object A, object B):
         """Returns A @ B (both square scipy.sparse CSR, same size) as a new csr_matrix."""
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-        if not scipy.sparse.isspmatrix_csr(B):
-            B = B.tocsr()
-
-        cdef int aN = A.shape[0]
-        cdef int bN = B.shape[0]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aPtr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aCol = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] aVal = np.ascontiguousarray(A.data, dtype=np.float64)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bPtr = np.ascontiguousarray(B.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bCol = np.ascontiguousarray(B.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] bVal = np.ascontiguousarray(B.data, dtype=np.float64)
-        cdef int[::1] aPtr_ = aPtr
-        cdef int[::1] aCol_ = aCol
-        cdef double[::1] aVal_ = aVal
-        cdef int[::1] bPtr_ = bPtr
-        cdef int[::1] bCol_ = bCol
-        cdef double[::1] bVal_ = bVal
-        self.helper.product(aN, &aPtr_[0], &aCol_[0], &aVal_[0], bN, &bPtr_[0], &bCol_[0], &bVal_[0])
+        A, aPtr, aCol, aVal = _csrArrays(A)
+        B, bPtr, bCol, bVal = _csrArrays(B)
+        self.helper.product(A.shape[0], _intData(aPtr), _intData(aCol), _constDoubleData(aVal),
+                            B.shape[0], _intData(bPtr), _intData(bCol), _constDoubleData(bVal))
         return self._copyOut()
 
     def sum(self, double alpha, object A, double beta, object B):
         """Returns alpha*A + beta*B (both square scipy.sparse CSR, same size) as a new csr_matrix."""
+        A, aPtr, aCol, aVal = _csrArrays(A)
+        B, bPtr, bCol, bVal = _csrArrays(B)
+        self.helper.sum(alpha, A.shape[0], _intData(aPtr), _intData(aCol), _constDoubleData(aVal),
+                        beta, B.shape[0], _intData(bPtr), _intData(bCol), _constDoubleData(bVal))
+        return self._copyOut()
+
+
+cdef class PyAMGCLPTwoGrid:
+    """The p-two-grid (P1) preconditioner of :mod:`edelweissfe.linsolve.blockamg.ptwogrid`, built and
+    applied entirely in C++: Dirichlet detection, the restricted prolongation ``P``, the Galerkin
+    coarse operator ``P^T A P``, the coarse AMGCL hierarchy, the fine Chebyshev smoother and the
+    whole two-grid cycle, all OpenMP-threaded -- no Python runs inside :meth:`applyPreconditioner`.
+    See ``PTwoGridPreconditionerT`` in ``amgcl-wrapper.hpp`` for the Dirichlet scheme and the
+    fine spectral-radius estimate.
+    """
+    cdef PTwoGridPreconditioner* preconditioner
+
+    def __cinit__(self, dict params):
+        """
+        params: the flat parameter tree, e.g.
+        {"nuPre": 1, "nuPost": 1, "fineDegree": 5, "fineLower": 0.01, "fineHigher": 1.1, "finePowerIters": 300,
+        "fineRecheckIters": 15, "fineBlockSize": 1, "fineValueType": "double", "coarseValueType": "double",
+        "coarse": {<AMGCL preconditioner tree>}}
+        (``nu`` sets both sweep counts). The sweep counts, ``fineDegree`` (at least 1), the block size
+        and the value types are validated here, before any build.
+        """
+        cdef bytes json_bytes = json.dumps(params).encode("utf-8")
+        cdef const char* c_json = json_bytes
+        self.preconditioner = new PTwoGridPreconditioner(c_json)
+
+    def __dealloc__(self):
+        if self.preconditioner != NULL:
+            del self.preconditioner
+
+    @staticmethod
+    def dirichletRows(object A):
+        """The rows of a scipy.sparse CSR matrix this preconditioner treats as Dirichlet rows: a nonzero
+        diagonal and no nonzero off-diagonal entry (explicitly stored zeros, which the Dirichlet
+        elimination keeps, do not count) -- the identity slave rows of the multi-point-constraint
+        condensation included. Returns a bool array."""
+        A, indptr, indices, data = _csrArrays(A)
+        mask = np.zeros(A.shape[0], dtype=np.int8)
+        PTwoGridPreconditioner.dirichletRowMask(A.shape[0], _intData(indptr), _intData(indices), _constDoubleData(data),
+                                                _writableByteData(mask))
+        return mask.astype(bool)
+
+    def build(self, object A, object isCorner, object edgeEndpoints, object nullspace=None,
+              double spectralRadius=0.0, object dominantVector=None):
+        """
+        Build the preconditioner for A (scipy.sparse csr_matrix, the field's equilibrated diagonal
+        block with its Dirichlet identity rows).
+
+        isCorner: (nNodes,) bool/int8; edgeEndpoints: (nNodes, 2) int, read for midside nodes only.
+        nullspace: (nFreeCoarseDofs, k) float64 coarse near null-space, or None.
+        spectralRadius: > 0 to start from this fine spectral radius instead of estimating it in full.
+        dominantVector: with spectralRadius, the previous build's :attr:`fineDominantVector`; the
+        radius is then re-checked by a few power iterations from it (``fineRecheckIters``) and
+        raised, or re-estimated in full, if the operator has stiffened.
+        """
         if not scipy.sparse.isspmatrix_csr(A):
             A = A.tocsr()
-        if not scipy.sparse.isspmatrix_csr(B):
-            B = B.tocsr()
+        if not A.has_sorted_indices:
+            A = A.sorted_indices()
+        A, indptr, indices, data = _csrArrays(A)
+        corner = np.ascontiguousarray(isCorner, dtype=np.int8)
+        endpoints = np.ascontiguousarray(np.asarray(edgeEndpoints, dtype=np.int32).reshape(-1))
+        cdef int nNodes = corner.shape[0]
+        if endpoints.shape[0] != 2 * nNodes or (nNodes > 0 and np.ndim(edgeEndpoints) != 2):
+            raise ValueError("edgeEndpoints must have shape (nNodes, 2)")
+        B = np.zeros((0, 0)) if nullspace is None else np.ascontiguousarray(nullspace, dtype=np.float64)
+        if B.ndim != 2:
+            raise ValueError("the coarse near null-space must be a 2D array")
+        dominant = np.zeros(0) if dominantVector is None else np.ascontiguousarray(dominantVector, dtype=np.float64)
+        self.preconditioner.build(A.shape[0], _intData(indptr), _intData(indices), _constDoubleData(data),
+                                  nNodes, _byteData(corner), _intData(endpoints),
+                                  _constDoubleData(B.reshape(-1)), B.shape[0], B.shape[1],
+                                  spectralRadius, _constDoubleData(dominant), dominant.shape[0])
 
-        cdef int aN = A.shape[0]
-        cdef int bN = B.shape[0]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aPtr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aCol = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] aVal = np.ascontiguousarray(A.data, dtype=np.float64)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bPtr = np.ascontiguousarray(B.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bCol = np.ascontiguousarray(B.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] bVal = np.ascontiguousarray(B.data, dtype=np.float64)
-        cdef int[::1] aPtr_ = aPtr
-        cdef int[::1] aCol_ = aCol
-        cdef double[::1] aVal_ = aVal
-        cdef int[::1] bPtr_ = bPtr
-        cdef int[::1] bCol_ = bCol
-        cdef double[::1] bVal_ = bVal
-        self.helper.sum(alpha, aN, &aPtr_[0], &aCol_[0], &aVal_[0], beta, bN, &bPtr_[0], &bCol_[0], &bVal_[0])
-        return self._copyOut()
+    def applyPreconditioner(self, object r):
+        """One two-grid cycle: returns M^-1 r as a new float64 array (Dirichlet rows solved exactly)."""
+        rArray = np.ascontiguousarray(r, dtype=np.float64).reshape(-1)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x = np.empty(rArray.shape[0], dtype=np.float64)
+        # the C++ apply checks the length against the built size
+        self.preconditioner.apply(rArray.shape[0], _constDoubleData(rArray), _doubleData(x))
+        return x
+
+    @property
+    def fineSpectralRadius(self):
+        """The fine operator's spectral radius the Chebyshev smoother was built with -- estimated, or
+        the one handed to :meth:`build`."""
+        return self.preconditioner.fineSpectralRadius()
+
+    @property
+    def fineDominantVector(self):
+        """The power iteration's last iterate, the estimate of the fine operator's dominant
+        eigenvector -- hand it back to the next :meth:`build` with :attr:`fineSpectralRadius`. Empty
+        if the radius was used as supplied, without a re-check."""
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] v = np.empty(
+            self.preconditioner.fineDominantVectorSize(), dtype=np.float64
+        )
+        cdef double[::1] v_ = v
+        if v.shape[0] > 0:
+            self.preconditioner.copyFineDominantVector(&v_[0])
+        return v
+
+    @property
+    def fineSpectralRadiusSource(self):
+        """How the last build arrived at its fine spectral radius: ``"estimated"`` in full,
+        ``"supplied"`` and kept, ``"raised"`` by the re-check, or ``"re-estimated"`` in full because
+        the re-check found the operator stiffened beyond the smoother's margin."""
+        return ("estimated", "supplied", "raised", "re-estimated")[self.preconditioner.fineSpectralRadiusSource()]
+
+    @property
+    def nCoarseFree(self):
+        """The number of free coarse DOFs (rows of the Galerkin operator)."""
+        return self.preconditioner.nCoarseFree()
+
+    def timings(self):
+        """Cumulative wall time [s] of the build stages (of the last build) and of the apply (fine
+        smoothing incl. the residual, coarse correction incl. restriction and prolongation)."""
+        return {
+            "setup: dirichlet + P": self.preconditioner.setupDirichletAndPSeconds_,
+            "setup: galerkin P^T A P": self.preconditioner.setupGalerkinSeconds_,
+            "setup: coarse hierarchy": self.preconditioner.setupCoarseSeconds_,
+            "setup: fine operator": self.preconditioner.setupFineOperatorSeconds_,
+            "setup: fine spectral radius": self.preconditioner.setupSpectralRadiusSeconds_,
+            "apply: fine": self.preconditioner.applyFineSeconds_,
+            "apply: coarse": self.preconditioner.applyCoarseSeconds_,
+        }
+
+    def report(self):
+        """The coarse level's AMGCL hierarchy report."""
+        return self.preconditioner.report().decode("utf-8")

@@ -60,17 +60,33 @@ every consumer of the DOF vector layout (Dirichlet indices, convergence checks, 
 write-back, field outputs) remains untouched.
 
 With the transformation matrix :math:`T` (identity on independent DOFs, row :math:`s` carrying the
-weights :math:`N_a` in the master columns, slave columns entirely zero) and the constraint-row
-matrix :math:`C` (rows :math:`s` only: :math:`C_{ss} = 1`, :math:`C_{s m_a} = -N_a`), the
-condensed implicit system reads
+weights :math:`N_a` in the master columns, slave columns entirely zero), both the slave rows and the
+slave columns of :math:`T^T K T` are structurally zero. They are filled with the identity
+:math:`I_s` (ones on the slave diagonal, nothing else), so the condensed implicit system reads
 
 .. math::
-    (T^T K \\, T + C) \\; \\delta U = T^T R,
+    (T^T K \\, T + I_s) \\; \\delta U = \\tilde{R},
+    \\qquad \\tilde{R}_m = (T^T R)_m, \\qquad
+    \\tilde{R}_s = -\\Big(dU_s - \\sum_a N_a \\, dU_{m_a}\\Big),
 
-where the slave rows of :math:`T^T K T` are structurally zero and :math:`C` re-inserts the
-constraint equations, so the solution satisfies
-:math:`\\delta U_s = \\sum_a N_a \\, \\delta U_{m_a}` exactly. The row replacement breaks symmetry
-in exactly the same benign way the existing Dirichlet row treatment does.
+and the slave DOFs are recovered from the masters after the linear solve
+(:meth:`MultiPointConstraintTransformation.recoverSlaveSolution`):
+
+.. math::
+    \\delta U_s \\leftarrow \\tilde{R}_s + \\sum_a N_a \\, \\delta U_{m_a},
+
+which satisfies the constraint :math:`dU_s + \\delta U_s = \\sum_a N_a (dU_{m_a} + \\delta U_{m_a})`
+exactly. The masters decouple from the slaves completely, so the condensed operator is symmetric
+whenever :math:`K` is, and its slave rows carry no scale of their own -- in particular no master
+coupling that a symmetric diagonal equilibration :math:`D = \\mathrm{diag}(|A_{ii}|^{-1/2})` would
+blow up to :math:`N_a / \\sqrt{K_{mm}}` for a small-valued operator such as a consistent mass matrix.
+
+The Dirichlet elimination of a prescribed master's column moves nothing into a slave row (the slave
+rows hold no master columns), and the linear solve returns the prescribed increment at that master,
+so the recovery :math:`\\delta U_s \\mathrel{+}= \\sum_a N_a \\, \\delta U_{m_a}` with the full weights
+is exact for prescribed and free masters alike. (Writing the raw constraint equation into the slave
+rows instead, :math:`C_{ss} = 1, C_{s m_a} = -N_a`, would yield the same solution, but a
+block-triangular, non-symmetric operator.)
 
 For explicit dynamics with a lumped (diagonal) mass vector, the consistent row-sum lumping of
 :math:`T^T M T` stays diagonal: each master receives its own mass plus the :math:`N_a`-weighted
@@ -146,18 +162,17 @@ class MultiPointConstraintTransformation:
         own OpenMP-threaded ``product()``/``sum()`` instead of SciPy's single-threaded CSR sparse
         routines -- SciPy's sparse module carries no OpenMP parallelism at all, the same gap this
         codebase also closes for its outer GMRES matvec and AMG relaxation kernels elsewhere.
-        Offline-measured on a reference 280k-dof model: **~2.4–2.6x faster** than the direct
-        expression (``~1.4–1.5 s/call`` vs ``~2.4–2.7 s/call``), correctness-verified to
-        floating-point precision.
+        Offline-measured on a reference model: faster than the direct
+        expression, correctness-verified to floating-point precision.
 
         AMGCL's ``product()``/``sum()`` do not eliminate exact-cancellation zeros the way SciPy's
-        own sparse routines do -- confirmed directly that the extra entries are >99.9999% bit-exact
-        zero (20,102,955 of 20,102,975 on the reference model, the rest floating-point noise at
-        ~1e-19 relative scale), so this method leaves noticeably more raw nnz (~1.6x) than the plain
+        own sparse routines do -- confirmed directly that effectively all of the extra entries are
+        bit-exact zero on the reference model (the rest floating-point noise at a tiny relative
+        scale), so this method leaves noticeably more raw nnz than the plain
         expression. **Not** pruned here: :meth:`~edelweissfe.solvers.nonlinearimplicitstatic.NIST.
         applyDirichletK` already calls ``eliminate_zeros()`` immediately after this, gated by the
-        existing ``pruneCondensedMatrixZeros`` option (default ``True``, uniformly for both
-        expressions) -- that gate exists precisely because PARDISO's reordering on these
+        existing ``pruneCondensedMatrixZeros`` option (default auto, pruned with PARDISO, uniformly
+        for both expressions) -- that gate exists precisely because PARDISO's reordering on these
         path-dependent condensed systems is known to drift with unpruned explicit-zero structural
         entries, and because ``blockamg``'s hierarchy-reuse gates on raw ``nnz``. Pruning here too
         would double that cost under the default config; setting ``pruneCondensedMatrixZeros=False``
@@ -212,17 +227,14 @@ class MultiPointConstraintTransformation:
         tVals = np.concatenate([np.ones(len(independentDofs)), np.array(wVals)])
         self._T = csr_matrix((tVals, (tRows, tCols)), shape=(nDof, nDof))
 
-        # C: the constraint equations themselves, re-inserted into the (structurally zero) slave
-        # rows of T^T K T.
-        cRows = np.concatenate(
-            [
-                self.slaveDofIndices,
-                np.repeat(self.slaveDofIndices, [len(recordOfSlaveDof[s]) for s in self.slaveDofIndices]),
-            ]
-        )
-        cCols = np.concatenate([self.slaveDofIndices, np.array(wCols, dtype=int)])
-        cVals = np.concatenate([np.ones(len(self.slaveDofIndices)), -np.array(wVals)])
-        self._C = csr_matrix((cVals, (cRows, cCols)), shape=(nDof, nDof))
+        # C: the identity on the slave DOFs only, filling the (structurally zero) slave rows and columns
+        # of T^T K T. Deliberately NOT the raw constraint equation (C_sm = -N_a): that would couple the
+        # slave rows to the masters one-sidedly -- a non-symmetric operator whose slave-to-master
+        # couplings blow up under a symmetric diagonal equilibration of a small-valued K (e.g. a
+        # consistent mass matrix). The slaves are instead recovered after the solve, see
+        # recoverSlaveSolution.
+        nSlaves = len(self.slaveDofIndices)
+        self._C = csr_matrix((np.ones(nSlaves), (self.slaveDofIndices, self.slaveDofIndices)), shape=(nDof, nDof))
 
         self._useAmgclSpgemm = useAmgclSpgemm
         # Lazily populated by _transformSystemMatrixAmgcl on first use: self._T is fixed for the
@@ -309,7 +321,9 @@ class MultiPointConstraintTransformation:
         )
 
     def transformSystemMatrix(self, K: csr_matrix) -> csr_matrix:
-        """Condense the system matrix: :math:`\\tilde{K} = T^T K \\, T + C`.
+        """Condense the system matrix: :math:`\\tilde{K} = T^T K \\, T + C`, with :math:`C` the identity on
+        the slave DOFs. The slave DOFs of the solution must be completed with
+        :meth:`recoverSlaveSolution` after the linear solve.
 
         Dispatches to the AMGCL-threaded expression (``useAmgclSpgemm``) or the plain SciPy
         expression (default) -- see the constructor's ``useAmgclSpgemm`` docstring for why the
@@ -342,10 +356,9 @@ class MultiPointConstraintTransformation:
         Kt = self._amgclSpgemmHelper.sum(1.0, KtNoC, 1.0, self._C)
         # No eliminate_zeros() here, deliberately -- not because it is unneeded (AMGCL's
         # product()/sum() leave far more exact-cancellation zeros unpruned than SciPy's own SpGEMM
-        # does, confirmed directly: 54.3M nnz here vs. the plain expression's 34.2M on a reference
-        # model, with >99.9999% of that gap being bit-exact zero, not numerical
-        # approximation), but because NISTSolver.applyDirichletK already does this immediately
-        # after, gated by pruneCondensedMatrixZeros (default True), uniformly for both condensation
+        # does, confirmed directly on a reference model: substantially more stored entries than the plain
+        # expression, essentially all of the difference bit-exact zeros, not numerical approximation), but because NISTSolver.applyDirichletK already does this immediately
+        # after, gated by pruneCondensedMatrixZeros (default auto, pruned with PARDISO), uniformly for both condensation
         # strategies -- that gate exists precisely because PARDISO's reordering on these
         # path-dependent condensed systems is sensitive to extra explicit-zero structural entries
         # (nonlinearimplicitstatic.py's own documented, previously-observed drift), and because
@@ -377,6 +390,33 @@ class MultiPointConstraintTransformation:
         Rt = self._T.T @ R
         Rt[self.slaveDofIndices] = -(dU[self.slaveDofIndices] - self._W @ dU)
         return Rt
+
+    def recoverSlaveSolution(self, x: np.ndarray) -> np.ndarray:
+        """Complete the solution of the condensed system (in place): add the master-interpolated
+        part to the slave DOFs, :math:`x_s \\mathrel{+}= \\sum_a N_a \\, x_{m_a}`.
+
+        Must be called right after every linear solve of a system condensed with
+        :meth:`transformSystemMatrix` and :meth:`transformResidual`, before the solution is used: the
+        solve itself only returns the drift correction (the condensed residual's slave rows) at the
+        slave DOFs. The weights read master entries only (masters are independent DOFs), so the
+        order of the update does not matter. Prescribed (Dirichlet) masters are included: the solve
+        returns their prescribed increment, and the Dirichlet column elimination has moved nothing
+        into the slave rows.
+
+        Parameters
+        ----------
+        x
+            The solution of the condensed system, of shape ``(nDof,)`` or ``(nDof, nRhs)``; modified
+            in place.
+
+        Returns
+        -------
+        np.ndarray
+            The completed solution (the same object as ``x``).
+        """
+
+        x[self.slaveDofIndices] += self._W @ x
+        return x
 
     def foldLumpedMass(self, M: np.ndarray):
         """Fold the slave masses onto their masters (in place): :math:`M_{m_a} \\mathrel{+}= N_a
