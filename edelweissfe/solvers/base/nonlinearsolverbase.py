@@ -1035,7 +1035,9 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
         records = self._collectMultiPointConstraintRecords(model)
 
         if stepActions is not None:
-            records = self._reconcileMPCDirichletConflicts(records, stepActions)
+            records = self._reconcileMPCDirichletConflicts(
+                records, stepActions, getattr(self, "_slaveDofsYieldingToDirichlet", frozenset())
+            )
 
         # Without a record T is the identity: skip the T^T K T + C product and the pattern-changing zero pruning.
         if not records:
@@ -1104,8 +1106,12 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
         records = []
         claimed = set()
         dropped = {}
+        # The slave DOFs whose constraint expects a Dirichlet boundary condition to override them, see
+        # :attr:`~edelweissfe.constraints.base.multipointconstraintbase.MultiPointConstraintBase.slavesYieldToDirichlet`.
+        self._slaveDofsYieldingToDirichlet = set()
 
         for name, mpc in model.multiPointConstraints.items():
+            yieldsToDirichlet = getattr(mpc, "slavesYieldToDirichlet", False)
             for record in mpc.getMultiPointConstraints(self.system.numbering):
                 if record[0] in claimed:
                     if not mpc.mayYieldSlaveToEarlierClaim:
@@ -1118,6 +1124,8 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
                     continue
                 claimed.add(record[0])
                 records.append(record)
+                if yieldsToDirichlet:
+                    self._slaveDofsYieldingToDirichlet.add(record[0])
 
         for name, count in dropped.items():
             self.journal.message(
@@ -1129,7 +1137,9 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
 
         return records
 
-    def _reconcileMPCDirichletConflicts(self, records: list, stepActions: dict) -> list:
+    def _reconcileMPCDirichletConflicts(
+        self, records: list, stepActions: dict, slaveDofsYieldingToDirichlet: set = frozenset()
+    ) -> list:
         """Drop the multi-point-constraint records whose slave DOF is also Dirichlet-prescribed, so
         the boundary condition takes precedence -- and report what was dropped.
 
@@ -1153,6 +1163,11 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
         Masters are resolved transitively first (a master may itself be a slave), exactly as the
         transformation does before it enforces anything.
 
+        The slave DOFs of a constraint whose slaves yield to a Dirichlet boundary condition
+        (:attr:`~edelweissfe.constraints.base.multipointconstraintbase.MultiPointConstraintBase.slavesYieldToDirichlet`,
+        given as ``slaveDofsYieldingToDirichlet``) are dropped as well, but counted apart and reported quietly:
+        for such a constraint the boundary condition winning is the intended behaviour.
+
         Returns
         -------
         list
@@ -1167,6 +1182,7 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
 
         dropped = set()
         nRedundant = 0
+        nYielded = 0
         overridden = []
         for slaveDof, masters in flattened.items():
             if slaveDof not in prescribed:
@@ -1189,7 +1205,9 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
                     unresolvedWeight += abs(coefficient)
 
             dropped.add(slaveDof)
-            if unresolvedWeight <= 1e-12 * scale and abs(delivered - target) <= 1e-12 * max(1.0, abs(target)):
+            if slaveDof in slaveDofsYieldingToDirichlet:
+                nYielded += 1
+            elif unresolvedWeight <= 1e-12 * scale and abs(delivered - target) <= 1e-12 * max(1.0, abs(target)):
                 nRedundant += 1
             else:
                 weightFraction = unresolvedWeight / totalWeight if totalWeight > 0.0 else 1.0
@@ -1198,6 +1216,13 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
         if not dropped:
             return records
 
+        if nYielded:
+            self.journal.message(
+                "{:} slave DOF(s) of multi-point constraints that yield to Dirichlet boundary conditions are "
+                "prescribed instead".format(nYielded),
+                self.identification,
+                2,
+            )
         if nRedundant:
             self.journal.message(
                 "reconciled {:} Dirichlet/constraint conflict(s) that were exactly redundant "
