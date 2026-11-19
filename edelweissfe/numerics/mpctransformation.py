@@ -216,6 +216,15 @@ class MultiPointConstraintTransformation:
         self._threadedCondensation = None
 
     @property
+    def extensionMatrix(self) -> csr_matrix:
+        """The extension operator :math:`T` (``nDof x nDof``): the identity on the independent DOFs, the master
+        weights in the slave rows, zero slave columns; :math:`\\Delta U = T \\, \\Delta U` for any increment that
+        satisfies the constraints. A matrix-free solver condenses with it (:math:`T^T R`, :math:`T^T M T`), see
+        :class:`~edelweissfe.solvers.dynamicrelaxation.DynamicRelaxation`. Read only."""
+
+        return self._T
+
+    @property
     def nEliminatedDof(self) -> int:
         """The number of slave DOFs eliminated from the system of equations."""
 

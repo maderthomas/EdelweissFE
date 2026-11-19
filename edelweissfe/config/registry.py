@@ -260,6 +260,8 @@ for _solverName, _target in {
     "NESTParallel": "nonlinearexplicitstaticparallel:NESTParallel",
     "NEDParallel": "nonlinearexplicitdynamicparallel:NEDParallel",
     "NISTPArcLength": "nonlinearimplicitstaticparallelarclength:NISTPArcLength",
+    "DynamicRelaxation": "dynamicrelaxation:DynamicRelaxation",
+    "DR": "dynamicrelaxation:DynamicRelaxation",
 }.items():
     _BUILTINS[("solver", _solverName.casefold())] = f"edelweissfe.solvers.{_target}"
 
