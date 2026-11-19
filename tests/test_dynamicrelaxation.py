@@ -273,8 +273,25 @@ def test_the_row_sums_of_dense_and_listed_blocks():
     K.target = K.rowSumsOfOthers
     K[listed][:] = [-1.0, 5.0, -7.0]
     K.flush()
+    K.finalize()
     np.testing.assert_allclose(K.rowSumsOfElements, [3.0, 7.0, 0.0, 0.0])
     np.testing.assert_allclose(K.rowSumsOfOthers, [0.0, 6.0, 0.0, 7.0])
+
+    # the next evaluation: the layout is kept, the values are new; a second dense block of the same size and an
+    # entity that gets two blocks (as a cell and as the host of a body load) change the layout
+    other = Dense()
+    locations[other] = np.array([2, 3])
+    K.beginAssembly()
+    K.target = K.rowSumsOfElements
+    K[dense][:] = [[2.0, -4.0], [6.0, 8.0]]
+    K[other][:] = [[1.0, 1.0], [0.0, -1.0]]
+    K.target = K.rowSumsOfOthers
+    K[dense][:] = [[1.0, 0.0], [0.0, 0.0]]
+    K.target = None
+    K[listed][:] = [100.0, 100.0, 100.0]  # nowhere
+    K.finalize()
+    np.testing.assert_allclose(K.rowSumsOfElements, [6.0, 14.0, 2.0, 1.0])
+    np.testing.assert_allclose(K.rowSumsOfOthers, [1.0, 0.0, 0.0, 0.0])
 
 
 def plateDeck(solver: str, options: str = "") -> str:

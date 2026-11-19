@@ -96,7 +96,9 @@ M T x`.
 **Dirichlet** DOFs take their prescribed increment from the start and do not move in the iteration; their residual
 (the reaction) is excluded from the convergence check. The reference :math:`\\|\\boldsymbol{f}_\\mathrm{ext}\\|_2` is the
 norm of the loads of the step at the end of the increment (all DOFs); without loads (displacement control) the norm of
-the internal forces, reactions included, is taken instead.
+the internal forces, reactions included, is taken instead. A residual below ``drAbsoluteTolerance`` (:math:`10^{-12}`,
+in the units of the forces) is converged, too: in a state without any load (e.g. the zero increment that starts a
+step) the ratio is round-off over round-off.
 
 Every iteration evaluates the model once. ``drMaxIterations`` bounds an increment (a ``ReachedMaxIterations`` cuts it
 back like a Newton failure); a non-finite residual, or one that grows beyond ``drDivergenceRatio`` times its first
@@ -116,7 +118,7 @@ from scipy.sparse.linalg import splu
 
 import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.numerics.dofvector import DofVector
-from edelweissfe.numerics.systemmatrixassembly import _ScratchSystemMatrixBlocks
+from edelweissfe.numerics.systemmatrixassembly import SystemMatrixBlocks
 from edelweissfe.numerics.systemmatrixcontributor import countEntriesOfBlock
 from edelweissfe.solvers.nonlinearimplicitstatic import NIST
 from edelweissfe.timesteppers.timestep import TimeStep
@@ -131,6 +133,11 @@ class DynamicRelaxationSchema(NIST.schema):
 
     drTolerance: float | None = schemaField(
         description="Convergence: ||R||_2 / ||f_ext||_2 below it (paper: 1e-9).", dtype=float, default=1e-9
+    )
+    drAbsoluteTolerance: float | None = schemaField(
+        description="Convergence also if ||R||_2 is below it (a state without load, where the ratio is 0/0).",
+        dtype=float,
+        default=1e-12,
     )
     drMaxIterations: int | None = schemaField(
         description="The maximum number of dynamic relaxation iterations of an increment.", dtype=int, default=200000
@@ -185,10 +192,17 @@ class DynamicRelaxationSchema(NIST.schema):
     )
 
 
-class RowSumBlocks(_ScratchSystemMatrixBlocks):
-    """The system matrix blocks of a matrix-free solver: every entity writes its block into a scratch array, which is
-    not assembled; if :attr:`target` is set, the absolute row sums of the block, :math:`\\sum_j |K^e_{ij}|`, are added
-    to it at the entity's DOFs. Dense blocks and blocks of an entity's own layout (``localEntriesOfBlock``) alike.
+class RowSumBlocks(SystemMatrixBlocks):
+    """The system matrix blocks of a matrix-free solver: the blocks are never assembled into a matrix; only their
+    absolute row sums, :math:`\\sum_j |K^e_{ij}|`, are summed per DOF of the discrete system, into
+    :attr:`rowSumsOfElements` or :attr:`rowSumsOfOthers`, whichever :attr:`target` names when the block is handed
+    out (``None``: nowhere, the block goes into a scratch array). Dense blocks and blocks of an entity's own layout
+    (``localEntriesOfBlock``) alike.
+
+    The blocks of an evaluation lie one after the other in one buffer, in the order they are handed out, which is the
+    same in every evaluation (the layout is kept, and redone from the first entity that differs); :meth:`finalize`
+    sums them per row, vectorised over the dense blocks of equal size. An entity may get several blocks in one
+    evaluation (e.g. a cell, and a body load on it).
 
     Parameters
     ----------
@@ -199,40 +213,98 @@ class RowSumBlocks(_ScratchSystemMatrixBlocks):
     """
 
     def __init__(self, locations, nDof: int):
-        super().__init__()
         self.locations = locations
         self.nDof = nDof
-        #: The row sums of the blocks of the elements (and of the cells and particles of a meshfree model).
-        self.rowSumsOfElements = np.zeros(nDof)
-        #: The row sums of all other blocks: loads, constraints.
-        self.rowSumsOfOthers = np.zeros(nDof)
-        #: Where the row sums of the next blocks go (None: nowhere).
+        self._rowSums = np.zeros((2, nDof))
+        self._views = (self._rowSums[0], self._rowSums[1])
+        #: Where the row sums of the blocks handed out next go: :attr:`rowSumsOfElements`, :attr:`rowSumsOfOthers`, or
+        #: None.
         self.target = None
-        self._localRows = {}
+        self._buffer = np.zeros(0)
+        self._scratch = np.zeros(0)
+        self._layout = []
+        self._cursor = 0
+        self._groups = None
+
+    @property
+    def rowSumsOfElements(self) -> np.ndarray:
+        """The row sums of the blocks of the elements (and the cells and particles of a meshfree model)."""
+        return self._views[0]
+
+    @property
+    def rowSumsOfOthers(self) -> np.ndarray:
+        """The row sums of all other blocks: loads, constraints."""
+        return self._views[1]
 
     def beginAssembly(self):
-        """Start the row sums of a new evaluation."""
-        self.dropPendingBlock()
-        self.rowSumsOfElements[:] = 0.0
-        self.rowSumsOfOthers[:] = 0.0
+        """Start a new evaluation."""
+        self._cursor = 0
 
-    def numberOfEntriesInBlock(self, entity) -> int:
-        return countEntriesOfBlock(entity)
-
-    def _commit(self, entity, values: np.ndarray):
-        if self.target is None:
-            return
-        n = entity.nDof
-        if entity.couplesAllItsDofs:
-            rowSums = np.abs(values.reshape((n, n), order="F")).sum(axis=1)
+    def __getitem__(self, entity) -> np.ndarray:
+        target = self.target
+        kind = None if target is None else (0 if target is self._views[0] else 1)
+        if kind is None:
+            count = countEntriesOfBlock(entity)
+            if count > self._scratch.shape[0]:
+                self._scratch = np.zeros(count)
+            values = self._scratch[:count]
+            values[:] = 0.0
+            return entity.shapeBlock(values)
+        i = self._cursor
+        layout = self._layout
+        if i < len(layout) and layout[i][0] is entity and layout[i][3] == kind:
+            _, offset, count, _ = layout[i]
         else:
-            key = id(entity)
-            rows = self._localRows.get(key)
-            if rows is None or rows[0] is not entity:
-                rows = (entity, np.asarray(entity.localEntriesOfBlock()[0]))
-                self._localRows[key] = rows
-            rowSums = np.bincount(rows[1], weights=np.abs(values), minlength=n)
-        np.add.at(self.target, self.locations[entity], rowSums)
+            del layout[i:]
+            offset = layout[-1][1] + layout[-1][2] if layout else 0
+            count = countEntriesOfBlock(entity)
+            layout.append((entity, offset, count, kind))
+            self._groups = None
+            if offset + count > self._buffer.shape[0]:
+                grown = np.zeros(max(2 * self._buffer.shape[0], offset + count))
+                grown[:offset] = self._buffer[:offset]
+                self._buffer = grown
+        self._cursor = i + 1
+        values = self._buffer[offset : offset + count]
+        values[:] = 0.0
+        return entity.shapeBlock(values)
+
+    def flush(self):
+        """Nothing to commit: the blocks stay in the buffer until :meth:`finalize`."""
+
+    def _buildGroups(self):
+        dense, listed = {}, []
+        for entity, offset, count, kind in self._layout:
+            locations = np.asarray(self.locations[entity])
+            if getattr(entity, "couplesAllItsDofs", True):
+                dense.setdefault((kind, entity.nDof), []).append((offset, locations))
+            else:
+                listed.append((kind, offset, count, np.asarray(entity.localEntriesOfBlock()[0]), locations))
+        groups = []
+        for (kind, n), members in dense.items():
+            offsets = np.array([o for o, _ in members])
+            groups.append(
+                (kind, n, offsets[:, None] + np.arange(n * n)[None, :], np.array([loc for _, loc in members]).ravel())
+            )
+        self._groups = (groups, listed)
+
+    def finalize(self):
+        """Sum the blocks of the evaluation just done per row, into :attr:`rowSumsOfElements` and
+        :attr:`rowSumsOfOthers`."""
+        if self._cursor < len(self._layout):
+            del self._layout[self._cursor :]
+            self._groups = None
+        if self._groups is None:
+            self._buildGroups()
+        groups, listed = self._groups
+        self._rowSums[:] = 0.0
+        for kind, n, index, locations in groups:
+            # column-major blocks: values[a + n b] = K[a, b]; as (k, b, a), the row sums are the sums over b
+            sums = np.abs(self._buffer[index]).reshape(-1, n, n).sum(axis=1).ravel()
+            self._rowSums[kind] += np.bincount(locations, weights=sums, minlength=self.nDof)
+        for kind, offset, count, rows, locations in listed:
+            sums = np.bincount(rows, weights=np.abs(self._buffer[offset : offset + count]), minlength=len(locations))
+            np.add.at(self._rowSums[kind], locations, sums)
 
 
 class DynamicRelaxation(NIST):
@@ -258,6 +330,7 @@ class DynamicRelaxation(NIST):
 
     SolverSpecificOptions = NIST.SolverSpecificOptions | {
         "drTolerance": 1e-9,
+        "drAbsoluteTolerance": 1e-12,
         "drMaxIterations": 200000,
         "drDivergenceRatio": 1e8,
         "fictitiousMass": "gerschgorin",
@@ -328,7 +401,6 @@ class DynamicRelaxation(NIST):
             K.target = K.rowSumsOfElements if self._needRowSums else None
         P, K, F = super().assembleInternalForces(U_np, dU, P, K, F, timeStep)
         if isinstance(K, RowSumBlocks):
-            K.flush()
             K.target = K.rowSumsOfOthers if self._needRowSums else None
         return P, K, F
 
@@ -424,6 +496,8 @@ class DynamicRelaxation(NIST):
             P_, _, _ = self.assembleResidualAndTangent(
                 U_n, dU, U_np, R_, P, PLoadsAndConstraints, F, FConstraints, K, stepActions, model, timeStep
             )
+            if self._needRowSums:
+                K.finalize()
             return P_
 
         def assembleMass():
@@ -484,7 +558,7 @@ class DynamicRelaxation(NIST):
             if not np.isfinite(rho):
                 record["reason"] = "non-finite residual"
                 raise DivergingSolution("dynamic relaxation: non-finite residual in iteration {:}".format(iteration))
-            if rho < tol:
+            if rho < tol or float(np.linalg.norm(r)) <= o["drAbsoluteTolerance"]:
                 record["converged"] = True
                 break
             if rho > o["drDivergenceRatio"] * rho0:
