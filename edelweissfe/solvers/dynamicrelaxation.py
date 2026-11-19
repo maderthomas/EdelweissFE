@@ -122,7 +122,7 @@ from edelweissfe.numerics.systemmatrixassembly import SystemMatrixBlocks
 from edelweissfe.numerics.systemmatrixcontributor import countEntriesOfBlock
 from edelweissfe.solvers.nonlinearimplicitstatic import NIST
 from edelweissfe.timesteppers.timestep import TimeStep
-from edelweissfe.utils.exceptions import DivergingSolution, ReachedMaxIterations
+from edelweissfe.utils.exceptions import CutbackRequest, DivergingSolution, ReachedMaxIterations
 from edelweissfe.utils.schema import schemaField
 
 
@@ -493,9 +493,15 @@ class DynamicRelaxation(NIST):
 
         def evaluate():
             R_ = R
-            P_, _, _ = self.assembleResidualAndTangent(
-                U_n, dU, U_np, R_, P, PLoadsAndConstraints, F, FConstraints, K, stepActions, model, timeStep
-            )
+            try:
+                P_, _, _ = self.assembleResidualAndTangent(
+                    U_n, dU, U_np, R_, P, PLoadsAndConstraints, F, FConstraints, K, stepActions, model, timeStep
+                )
+            except CutbackRequest as e:
+                record["reason"] = "cutback request in iteration {:}: {:}".format(
+                    len(record["residuals"]), str(e)[:200]
+                )
+                raise
             if self._needRowSums:
                 K.finalize()
             return P_
